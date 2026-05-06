@@ -147,3 +147,28 @@ export interface HealthStatus {
   modelKey?: string;
   timestamp: string;
 }
+
+// ─── Model Management Types ────────────────────────────────────────────────
+
+/** Result of a full model readiness check */
+export interface ModelReadiness {
+  connected: boolean;
+  modelFound: boolean;
+  modelLoaded: boolean;
+  visionCapable: boolean;
+  modelKey: string;
+  displayName?: string;
+}
+
+// ─── Custom Error Types ────────────────────────────────────────────────────
+
+/**
+ * Custom error class for known inference/application errors.
+ * Used instead of string-prefix matching to safely re-throw known errors.
+ */
+export class InferenceError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "InferenceError";
+  }
+}

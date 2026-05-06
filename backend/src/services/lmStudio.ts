@@ -6,6 +6,7 @@
 
 import sharp from "sharp";
 import type { LMStudioChatRequest, LMStudioChatResponse, LMStudioInputItem } from "../types";
+import { InferenceError } from "../types";
 import {
   LM_STUDIO_URL,
   LM_STUDIO_MODEL,
@@ -20,19 +21,31 @@ import {
 import { validateMagicBytes } from "../utils/validation";
 import { log } from "../utils/logger";
 
+// ─── Concurrency Lock ──────────────────────────────────────────────────────
+
+/**
+ * Lightweight inference semaphore.
+ * Only one inference request is allowed at a time to prevent GPU OOM
+ * and cascade-timeout on the single local LM Studio instance.
+ */
+let inferenceInProgress = false;
+
+// ─── Image Processing ───────────────────────────────────────────────────────
+
 /**
  * Optimizes an image for inference: resize + compress + convert to JPEG.
  * Returns a base64 data URL ready for the native API.
+ * Uses sharp's pipeline to minimize intermediate buffer copies.
  */
 async function optimizeImage(image: File): Promise<string> {
-  const buffer = await image.arrayBuffer();
+  const buffer = Buffer.from(await image.arrayBuffer());
 
   // Validate magic bytes before processing
-  if (!validateMagicBytes(buffer, image.type)) {
-    throw new Error("File gambar tidak valid atau rusak. Header file tidak sesuai dengan tipe yang dideklarasikan.");
+  if (!validateMagicBytes(buffer.buffer, image.type)) {
+    throw new InferenceError("File gambar tidak valid atau rusak. Header file tidak sesuai dengan tipe yang dideklarasikan.");
   }
 
-  const optimized = await sharp(Buffer.from(buffer))
+  const optimized = await sharp(buffer)
     .resize(IMAGE_MAX_DIMENSION, IMAGE_MAX_DIMENSION, {
       fit: "inside",         // Maintain aspect ratio, fit within bounds
       withoutEnlargement: true, // Don't upscale small images
@@ -49,6 +62,18 @@ async function optimizeImage(image: File): Promise<string> {
   });
 
   return `data:image/jpeg;base64,${base64}`;
+}
+
+// ─── Response Parsing ───────────────────────────────────────────────────────
+
+/**
+ * Validates that a parsed JSON object has the expected shape
+ * of a LMStudioChatResponse. Returns false if structure is invalid.
+ */
+function isValidChatResponse(data: unknown): data is LMStudioChatResponse {
+  if (typeof data !== "object" || data === null) return false;
+  const obj = data as Record<string, unknown>;
+  return Array.isArray(obj.output) && typeof obj.stats === "object" && obj.stats !== null;
 }
 
 /**
@@ -73,106 +98,164 @@ function extractResponseContent(response: LMStudioChatResponse): string | null {
 
 /**
  * Logs inference performance stats from the native API response.
+ * Guarded against null/undefined numeric fields to prevent crashes.
  */
 function logInferenceStats(
   response: LMStudioChatResponse,
   totalDurationMs: number
 ): void {
   const { stats } = response;
+  if (!stats) return;
+
   log.info("Inference complete", {
     totalDurationMs: totalDurationMs.toFixed(0),
-    inputTokens: stats.input_tokens,
-    outputTokens: stats.total_output_tokens,
-    tokensPerSecond: stats.tokens_per_second.toFixed(1),
-    timeToFirstToken: `${stats.time_to_first_token_seconds.toFixed(2)}s`,
-    ...(stats.model_load_time_seconds !== undefined && {
+    inputTokens: stats.input_tokens ?? 0,
+    outputTokens: stats.total_output_tokens ?? 0,
+    tokensPerSecond: typeof stats.tokens_per_second === "number"
+      ? stats.tokens_per_second.toFixed(1)
+      : "N/A",
+    timeToFirstToken: typeof stats.time_to_first_token_seconds === "number"
+      ? `${stats.time_to_first_token_seconds.toFixed(2)}s`
+      : "N/A",
+    ...(typeof stats.model_load_time_seconds === "number" && {
       modelLoadTime: `${stats.model_load_time_seconds.toFixed(2)}s`,
     }),
   });
 }
 
+// ─── Main Inference Function ────────────────────────────────────────────────
+
 /**
  * Sends an image and assistive prompt to LM Studio for inference.
  * Uses the native REST API: POST /api/v1/chat
  *
+ * Includes:
+ * - Concurrency lock (1 request at a time)
+ * - Image optimization before inference
+ * - Timeout via AbortController
+ * - Safe JSON parsing with shape validation
+ * - Typed error handling via InferenceError
+ *
  * @param image - The uploaded image file
  * @param prompt - The context-aware assistive prompt
  * @returns The AI-generated description string
- * @throws Error if LM Studio is unreachable, times out, or returns invalid data
+ * @throws InferenceError for known application errors
+ * @throws Error with FALLBACK_RESPONSE for unexpected failures
  */
 export async function analyzeImage(
   image: File,
   prompt: string
 ): Promise<string> {
+  // Concurrency guard — reject if another inference is already running
+  if (inferenceInProgress) {
+    throw new InferenceError(
+      "Server sedang memproses permintaan lain. Silakan tunggu beberapa saat."
+    );
+  }
+
+  inferenceInProgress = true;
   const startTime = performance.now();
 
-  // Step 1: Optimize image
-  const dataUrl = await optimizeImage(image);
-
-  // Step 2: Build native API input
-  const input: LMStudioInputItem[] = [
-    { type: "text", content: prompt },
-    { type: "image", data_url: dataUrl },
-  ];
-
-  const requestBody: LMStudioChatRequest = {
-    model: LM_STUDIO_MODEL,
-    input,
-    system_prompt: SYSTEM_PROMPT,
-    temperature: INFERENCE_TEMPERATURE,
-    max_output_tokens: MAX_OUTPUT_TOKENS,
-    store: false, // No need to store assistive chats
-  };
-
-  // Step 3: Send to LM Studio with timeout
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), INFERENCE_TIMEOUT_MS);
-
   try {
-    log.info("Sending inference request", {
+    // Step 1: Optimize image
+    const dataUrl = await optimizeImage(image);
+
+    // Step 2: Build native API input
+    const input: LMStudioInputItem[] = [
+      { type: "text", content: prompt },
+      { type: "image", data_url: dataUrl },
+    ];
+
+    const requestBody: LMStudioChatRequest = {
       model: LM_STUDIO_MODEL,
-      promptLength: prompt.length,
-    });
+      input,
+      system_prompt: SYSTEM_PROMPT,
+      temperature: INFERENCE_TEMPERATURE,
+      max_output_tokens: MAX_OUTPUT_TOKENS,
+      store: false, // No need to store assistive chats
+    };
 
-    const response = await fetch(`${LM_STUDIO_URL}/api/v1/chat`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(requestBody),
-      signal: controller.signal,
-    });
+    // Step 3: Send to LM Studio with timeout
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), INFERENCE_TIMEOUT_MS);
 
-    if (!response.ok) {
-      const errorText = await response.text().catch(() => "Unknown error");
-      log.error("LM Studio returned error", {
-        status: response.status,
-        body: errorText.slice(0, 200),
+    try {
+      log.info("Sending inference request", {
+        model: LM_STUDIO_MODEL,
+        promptLength: prompt.length,
       });
-      throw new Error(
-        `Gagal mendapatkan respons dari AI (status ${response.status}).`
-      );
-    }
 
-    // Step 4: Parse response
-    const data = (await response.json()) as LMStudioChatResponse;
-    const totalDurationMs = performance.now() - startTime;
+      const response = await fetch(`${LM_STUDIO_URL}/api/v1/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(requestBody),
+        signal: controller.signal,
+      });
 
-    // Log performance stats
-    if (data.stats) {
+      if (!response.ok) {
+        const errorText = await response.text().catch(() => "Unknown error");
+        log.error("LM Studio returned error", {
+          status: response.status,
+          body: errorText.slice(0, 200),
+        });
+        throw new InferenceError(
+          `Gagal mendapatkan respons dari AI (status ${response.status}).`
+        );
+      }
+
+      // Step 4: Parse response — safely handle non-JSON responses
+      let rawData: unknown;
+      try {
+        rawData = await response.json();
+      } catch {
+        log.error("LM Studio returned non-JSON response");
+        throw new InferenceError(
+          "Respons dari AI tidak dapat diproses. Format respons tidak valid."
+        );
+      }
+
+      // Validate response shape before using
+      if (!isValidChatResponse(rawData)) {
+        log.error("LM Studio response has unexpected shape", {
+          keys: typeof rawData === "object" && rawData !== null
+            ? Object.keys(rawData).join(", ")
+            : typeof rawData,
+        });
+        throw new InferenceError(
+          "Respons dari AI memiliki format yang tidak dikenali."
+        );
+      }
+
+      const data = rawData;
+      const totalDurationMs = performance.now() - startTime;
+
+      // Log performance stats (safe — guarded against null fields)
       logInferenceStats(data, totalDurationMs);
-    }
 
-    // Step 5: Extract content
-    const content = extractResponseContent(data);
-    if (!content) {
-      log.warn("LM Studio returned empty content", {
-        output: JSON.stringify(data.output).slice(0, 200),
-      });
-      return FALLBACK_RESPONSE;
-    }
+      // Step 5: Extract content
+      const content = extractResponseContent(data);
+      if (!content) {
+        log.warn("LM Studio returned empty content", {
+          outputTypes: data.output.map((item) => item.type).join(", "),
+        });
+        return FALLBACK_RESPONSE;
+      }
 
-    return content;
+      return content;
+    } finally {
+      clearTimeout(timeoutId);
+    }
   } catch (error) {
     const durationMs = performance.now() - startTime;
+
+    // Re-throw known InferenceErrors as-is
+    if (error instanceof InferenceError) {
+      log.error("Inference failed", {
+        error: error.message,
+        durationMs: durationMs.toFixed(0),
+      });
+      throw error;
+    }
 
     // Timeout
     if (error instanceof DOMException && error.name === "AbortError") {
@@ -180,7 +263,7 @@ export async function analyzeImage(
         timeoutMs: INFERENCE_TIMEOUT_MS,
         elapsedMs: durationMs.toFixed(0),
       });
-      throw new Error(
+      throw new InferenceError(
         "Inferensi AI melebihi batas waktu. Silakan coba lagi."
       );
     }
@@ -194,17 +277,9 @@ export async function analyzeImage(
         url: LM_STUDIO_URL,
         error: error.message,
       });
-      throw new Error(
+      throw new InferenceError(
         "Tidak dapat terhubung ke server AI. Pastikan LM Studio berjalan."
       );
-    }
-
-    // Re-throw known application errors
-    if (error instanceof Error && error.message.startsWith("Gagal")) {
-      throw error;
-    }
-    if (error instanceof Error && error.message.startsWith("File gambar")) {
-      throw error;
     }
 
     // Unexpected errors
@@ -214,6 +289,6 @@ export async function analyzeImage(
     });
     throw new Error(FALLBACK_RESPONSE);
   } finally {
-    clearTimeout(timeoutId);
+    inferenceInProgress = false;
   }
 }

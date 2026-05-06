@@ -48,12 +48,12 @@ const app = new Elysia()
       };
     }
 
-    // Body size exceeded
+    // Body parse failure (malformed data, unsupported content type, etc.)
     if (code === "PARSE") {
-      set.status = 413;
+      set.status = 400;
       return {
         success: false,
-        error: "Ukuran permintaan terlalu besar.",
+        error: "Format permintaan tidak valid.",
       };
     }
 

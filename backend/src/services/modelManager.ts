@@ -1,21 +1,8 @@
-/**
- * Model Manager — handles LM Studio model availability and verification.
- * Uses the native REST API: GET /api/v1/models
- */
-
-import type { LMStudioModel, LMStudioModelsResponse } from "../types";
+import type { LMStudioModel, LMStudioModelsResponse, ModelReadiness } from "../types";
 import { LM_STUDIO_URL, LM_STUDIO_MODEL } from "../utils/constants";
 import { log } from "../utils/logger";
 
-/** Result of a full model readiness check */
-export interface ModelReadiness {
-  connected: boolean;
-  modelFound: boolean;
-  modelLoaded: boolean;
-  visionCapable: boolean;
-  modelKey: string;
-  displayName?: string;
-}
+export type { ModelReadiness };
 
 /**
  * Checks if LM Studio is reachable by pinging the models endpoint.
@@ -46,8 +33,21 @@ export async function getAvailableModels(): Promise<LMStudioModel[]> {
       return [];
     }
 
-    const data = (await response.json()) as LMStudioModelsResponse;
-    return data.models ?? [];
+    let data: unknown;
+    try {
+      data = await response.json();
+    } catch {
+      log.error("LM Studio models endpoint returned non-JSON response");
+      return [];
+    }
+
+    // Validate shape
+    if (typeof data !== "object" || data === null || !Array.isArray((data as Record<string, unknown>).models)) {
+      log.error("LM Studio models response has unexpected shape");
+      return [];
+    }
+
+    return (data as LMStudioModelsResponse).models;
   } catch (error) {
     log.error("Cannot reach LM Studio for model list", {
       url: LM_STUDIO_URL,

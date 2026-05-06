@@ -1,16 +1,32 @@
 /**
  * Health service — provides live status of backend, LM Studio, and model.
  * Used by GET /health endpoint.
+ * Includes a cache to prevent excessive LM Studio polling.
  */
 
 import type { HealthStatus, ServiceStatus } from "../types";
 import { verifyModelReady } from "./modelManager";
 
+// ─── Health Cache ───────────────────────────────────────────────────────────
+
+/** Cache TTL in milliseconds — health status is reused within this window */
+const HEALTH_CACHE_TTL_MS = 5_000;
+
+let cachedStatus: HealthStatus | null = null;
+let cacheTimestamp = 0;
+
 /**
  * Performs a live health check of all system components.
+ * Returns cached result if called within the TTL window.
  * Never throws — always returns a status object.
  */
 export async function getHealthStatus(): Promise<HealthStatus> {
+  // Return cached result if still fresh
+  const now = Date.now();
+  if (cachedStatus && now - cacheTimestamp < HEALTH_CACHE_TTL_MS) {
+    return { ...cachedStatus, timestamp: new Date().toISOString() };
+  }
+
   const status: HealthStatus = {
     backend: "ok",
     lmStudio: "error",
@@ -37,6 +53,10 @@ export async function getHealthStatus(): Promise<HealthStatus> {
     status.lmStudio = "error";
     status.model = "error";
   }
+
+  // Update cache
+  cachedStatus = status;
+  cacheTimestamp = now;
 
   return status;
 }
