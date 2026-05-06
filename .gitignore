@@ -1,3 +1,6 @@
+# Agent config (local only)
+.agents/
+
 # Dependencies
 node_modules/
 
