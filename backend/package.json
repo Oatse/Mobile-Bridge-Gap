@@ -1,0 +1,23 @@
+{
+  "name": "mbg-backend",
+  "version": "1.0.0",
+  "description": "MBG - AI Assistive Vision System Backend",
+  "module": "src/index.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "bun run --watch src/index.ts",
+    "start": "bun run src/index.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@elysia/cors": "^1.4.2",
+    "elysia": "^1.4.28",
+    "sharp": "^0.34.5"
+  }
+}
