@@ -47,3 +47,10 @@ mobile/ios/
 *.key
 *.mobileprovision
 *.orig.*
+
+# ML Models (large binary files)
+backend/models/
+
+# Test/benchmark artifacts
+backend/scripts/test-image.*
+backend/scripts/*-results.json

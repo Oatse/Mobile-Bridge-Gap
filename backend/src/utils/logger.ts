@@ -3,6 +3,8 @@
  * No external dependencies — wraps console with timestamps and levels.
  */
 
+import { DEPTH_DEBUG_LOGGING } from "./constants";
+
 type LogData = Record<string, unknown>;
 
 function formatTimestamp(): string {
@@ -37,10 +39,20 @@ function startup(message: string): void {
   console.log(`[${formatTimestamp()}] 🚀 ${message}`);
 }
 
+/**
+ * Debug-level logging for depth estimation diagnostics.
+ * Gated by DEPTH_DEBUG_LOGGING env var — produces no output in production.
+ */
+function debug(message: string, data?: LogData): void {
+  if (!DEPTH_DEBUG_LOGGING) return;
+  console.log(`[${formatTimestamp()}] 🔍 ${message}${formatData(data)}`);
+}
+
 export const log = {
   info,
   warn,
   error,
   request,
   startup,
+  debug,
 } as const;

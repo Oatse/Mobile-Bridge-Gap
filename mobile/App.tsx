@@ -36,6 +36,8 @@ export default function App() {
   const isProcessingRef = useRef(false);
   // Track the command object we already processed to prevent duplicates
   const processedCommandRef = useRef<string | null>(null);
+  // Track error recovery timer so it can be cleared on unmount
+  const errorRecoveryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // ─── Hooks ──────────────────────────────────────────────────────────────
 
@@ -47,10 +49,23 @@ export default function App() {
   // ─── Error Recovery ─────────────────────────────────────────────────────
 
   const recoverToIdle = useCallback(() => {
-    setTimeout(() => {
+    if (errorRecoveryTimerRef.current) {
+      clearTimeout(errorRecoveryTimerRef.current);
+    }
+    errorRecoveryTimerRef.current = setTimeout(() => {
+      errorRecoveryTimerRef.current = null;
       setAppState("idle");
       setStatusMessage(STATUS_MESSAGES.idle);
     }, ERROR_RECOVERY_DELAY_MS);
+  }, []);
+
+  // Cleanup error recovery timer on unmount
+  useEffect(() => {
+    return () => {
+      if (errorRecoveryTimerRef.current) {
+        clearTimeout(errorRecoveryTimerRef.current);
+      }
+    };
   }, []);
 
   const handleError = useCallback(

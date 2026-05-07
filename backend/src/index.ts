@@ -9,15 +9,26 @@ import { cors } from "@elysia/cors";
 import { describeRoute } from "./routes/describe";
 import { getHealthStatus, healthStatusToHttpCode } from "./services/healthService";
 import { verifyModelReady, logReadinessStatus } from "./services/modelManager";
-import { PORT, LM_STUDIO_URL, MAX_BODY_SIZE_BYTES } from "./utils/constants";
+import { preloadDepthModel } from "./services/depth/depthModel";
+import { PORT, LM_STUDIO_URL, MAX_BODY_SIZE_BYTES, ENABLE_DEPTH_ESTIMATION, DEPTH_INPUT_SIZE } from "./utils/constants";
 import { log } from "./utils/logger";
 
 // ─── Startup Verification ───────────────────────────────────────────────────
 
 async function runStartupChecks(): Promise<void> {
   log.startup("Running startup checks...");
+
+  // Verify LM Studio model readiness
   const readiness = await verifyModelReady();
   logReadinessStatus(readiness);
+
+  // Preload depth estimation model (non-fatal — server starts regardless)
+  if (ENABLE_DEPTH_ESTIMATION) {
+    log.startup(`Preloading depth estimation model (input: ${DEPTH_INPUT_SIZE}x${DEPTH_INPUT_SIZE})...`);
+    await preloadDepthModel();
+  } else {
+    log.startup("Depth estimation DISABLED via ENABLE_DEPTH_ESTIMATION=false");
+  }
 }
 
 // ─── App Setup ──────────────────────────────────────────────────────────────
@@ -77,13 +88,14 @@ const app = new Elysia()
   // Describe endpoint — main inference route
   .use(describeRoute)
   .listen({
+    hostname: "0.0.0.0",
     port: PORT,
     maxRequestBodySize: MAX_BODY_SIZE_BYTES,
   });
 
 // ─── Startup Logging ────────────────────────────────────────────────────────
 
-log.startup(`MBG Backend running on http://localhost:${PORT}`);
+log.startup(`MBG Backend running on http://0.0.0.0:${PORT}`);
 log.startup(`LM Studio endpoint: ${LM_STUDIO_URL}`);
 log.startup(`POST /describe — send image + userCommand`);
 log.startup(`GET  /health    — live system health check`);

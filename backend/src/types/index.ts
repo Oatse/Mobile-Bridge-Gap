@@ -9,6 +9,13 @@
 export interface DescribeResponse {
   success: true;
   description: string;
+  depth?: DepthInfo;
+}
+
+/** Lightweight depth info included in API responses */
+export interface DepthInfo {
+  proximity: string;
+  warning: string | null;
 }
 
 /** Error response returned on failures */
@@ -138,12 +145,13 @@ export interface LMStudioModelsResponse {
 
 // ─── Health Types ───────────────────────────────────────────────────────────
 
-export type ServiceStatus = "ok" | "degraded" | "error";
+export type ServiceStatus = "ok" | "degraded" | "error" | "disabled";
 
 export interface HealthStatus {
   backend: ServiceStatus;
   lmStudio: ServiceStatus;
   model: ServiceStatus;
+  depthModel: ServiceStatus;
   modelKey?: string;
   timestamp: string;
 }

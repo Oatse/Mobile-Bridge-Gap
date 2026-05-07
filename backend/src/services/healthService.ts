@@ -6,6 +6,8 @@
 
 import type { HealthStatus, ServiceStatus } from "../types";
 import { verifyModelReady } from "./modelManager";
+import { isDepthModelReady } from "./depth/depthModel";
+import { ENABLE_DEPTH_ESTIMATION } from "../utils/constants";
 
 // ─── Health Cache ───────────────────────────────────────────────────────────
 
@@ -31,6 +33,7 @@ export async function getHealthStatus(): Promise<HealthStatus> {
     backend: "ok",
     lmStudio: "error",
     model: "error",
+    depthModel: !ENABLE_DEPTH_ESTIMATION ? "disabled" : isDepthModelReady() ? "ok" : "error",
     timestamp: new Date().toISOString(),
   };
 

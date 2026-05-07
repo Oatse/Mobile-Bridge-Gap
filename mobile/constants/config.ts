@@ -4,7 +4,7 @@
  */
 
 /** Backend API base URL — change to your machine's local IP for device testing */
-export const API_BASE_URL = "http://192.168.1.3:3000";
+export const API_BASE_URL = "http://192.168.1.4:3000";
 
 /** Trigger keyword for voice commands */
 export const TRIGGER_KEYWORD = "MBG";

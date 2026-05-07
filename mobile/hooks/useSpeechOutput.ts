@@ -31,6 +31,7 @@ export default function useSpeechOutput(): UseSpeechOutputReturn {
       pitch: 1.0,
       rate: 0.95,
       onDone: () => setIsSpeaking(false),
+      onStopped: () => setIsSpeaking(false),
       onError: () => setIsSpeaking(false),
     });
   }, []);

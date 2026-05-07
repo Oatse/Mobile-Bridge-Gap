@@ -102,3 +102,50 @@ Rules:
 
 Good example: "Terdapat kursi di depan Anda. Jalur kanan lebih aman untuk berjalan."
 Bad example: "Terdapat ruangan modern dengan nuansa hangat dan pencahayaan estetik."`;
+
+// ─── Depth Estimation ───────────────────────────────────────────────────────
+
+import { resolve, dirname } from "path";
+import { fileURLToPath } from "url";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+
+/** Master toggle for depth estimation — set to false to disable entirely */
+export const ENABLE_DEPTH_ESTIMATION =
+  (process.env.ENABLE_DEPTH_ESTIMATION ?? "true").trim().toLowerCase() !== "false";
+
+/**
+ * Depth model input resolution (square).
+ * Lower = faster inference, potentially less spatial detail.
+ * Benchmark results (warm avg): 518→2365ms, 384→1221ms, 256→542ms.
+ * 256 chosen as default: 4.36x faster, negligible quality loss for assistive use.
+ * Override via env: DEPTH_INPUT_SIZE=518 for full resolution.
+ */
+export const DEPTH_INPUT_SIZE =
+  Number(process.env.DEPTH_INPUT_SIZE) || 256;
+
+/** Toggle verbose depth debug logging (preprocessing, inference, region values) */
+export const DEPTH_DEBUG_LOGGING =
+  (process.env.DEPTH_DEBUG_LOGGING ?? "false").trim().toLowerCase() === "true";
+
+/** Depth model identifier — matches the folder name under models/ */
+export const DEPTH_MODEL_ID = "depth-anything-v2-small";
+
+/** Absolute path to the models directory for local ONNX loading */
+export const DEPTH_MODEL_PATH = resolve(__dirname, "..", "..", "models");
+
+/** Maximum timeout for depth inference (ms) — safety net */
+export const DEPTH_INFERENCE_TIMEOUT_MS =
+  Number(process.env.DEPTH_INFERENCE_TIMEOUT_MS) || 10_000;
+
+/**
+ * Proximity thresholds for depth classification.
+ * Values are normalized depth (0 = closest, 1 = farthest).
+ * Objects with depth below the threshold are classified at that level.
+ */
+export const DEPTH_PROXIMITY_THRESHOLDS = {
+  sangat_dekat: 0.25, // Very close — urgent obstacle warning
+  dekat: 0.45,        // Close — nearby obstacle
+  sedang: 0.70,       // Medium distance — awareness only
+  // > 0.70 = "jauh" (far)
+} as const;

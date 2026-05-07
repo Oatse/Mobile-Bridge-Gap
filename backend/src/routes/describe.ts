@@ -1,15 +1,26 @@
 /**
  * POST /describe route handler.
- * Receives image + userCommand, runs inference, returns sanitized description.
+ * Receives image + userCommand, runs parallel inference (Gemma + Depth), returns fused description.
+ *
+ * Execution strategy:
+ * - Gemma inference (GPU via LM Studio) and Depth inference (CPU via ONNX) run in PARALLEL
+ * - Depth failure is non-fatal — falls back to Gemma-only response
+ * - Gemma failure uses existing error handling
+ * - Depth estimation can be disabled entirely via ENABLE_DEPTH_ESTIMATION=false
  */
 
 import { Elysia, t } from "elysia";
 import { validateImage, validateUserCommand } from "../utils/validation";
 import { buildPromptFromCommand, sanitizeResponse } from "../services/promptBuilder";
 import { analyzeImage } from "../services/lmStudio";
-import { FALLBACK_RESPONSE } from "../utils/constants";
+import { estimateDepth } from "../services/depth/depthInference";
+import { fuseGemmaWithDepth } from "../services/depth/responseFusion";
+import { FALLBACK_RESPONSE, ENABLE_DEPTH_ESTIMATION } from "../utils/constants";
 import { log } from "../utils/logger";
 import type { DescribeResponse, ErrorResponse } from "../types";
+import type { DepthAnalysisResult } from "../services/depth/types";
+
+// ─── Route Handler ──────────────────────────────────────────────────────────
 
 export const describeRoute = new Elysia().post(
   "/describe",
@@ -38,21 +49,57 @@ export const describeRoute = new Elysia().post(
     log.info("Processing describe request", {
       hasCommand: !!sanitizedCommand,
       command: effectiveCommand.slice(0, 80),
+      depthEnabled: ENABLE_DEPTH_ESTIMATION,
     });
 
-    // Run inference via LM Studio
-    try {
-      const rawDescription = await analyzeImage(image, prompt);
+    // Read image buffer once — shared between Gemma and Depth pipelines
+    const imageBuffer = Buffer.from(await image.arrayBuffer());
 
-      // Sanitize response for accessibility
-      const description = sanitizeResponse(rawDescription);
+    // Run inference via LM Studio (Gemma) + Depth estimation in PARALLEL
+    try {
+      const [gemmaSettled, depthSettled] = await Promise.allSettled([
+        analyzeImage(image, prompt),
+        ENABLE_DEPTH_ESTIMATION
+          ? estimateDepth(imageBuffer)
+          : Promise.resolve(null),
+      ]);
+
+      // Extract Gemma result — failure is fatal (throws)
+      if (gemmaSettled.status === "rejected") {
+        throw gemmaSettled.reason;
+      }
+      const rawDescription = gemmaSettled.value;
+
+      // Extract depth result — failure is non-fatal (null)
+      let depthResult: DepthAnalysisResult | null = null;
+      if (depthSettled.status === "fulfilled") {
+        depthResult = depthSettled.value;
+      } else {
+        log.warn("Depth inference failed during parallel execution", {
+          error: depthSettled.reason instanceof Error
+            ? depthSettled.reason.message
+            : String(depthSettled.reason),
+        });
+      }
+
+      // Sanitize Gemma response for accessibility
+      const sanitizedDescription = sanitizeResponse(rawDescription);
+
+      // Fuse Gemma description with depth proximity data
+      const { description, depth } = fuseGemmaWithDepth(sanitizedDescription, depthResult);
 
       const durationMs = performance.now() - startTime;
       log.request("POST", "/describe", durationMs, 200);
+      log.info("Response fused", {
+        hasDepth: !!depth,
+        proximity: depth?.proximity ?? "unavailable",
+        totalMs: durationMs.toFixed(0),
+      });
 
       return {
         success: true,
         description,
+        ...(depth && { depth }),
       } satisfies DescribeResponse;
     } catch (error) {
       const durationMs = performance.now() - startTime;
