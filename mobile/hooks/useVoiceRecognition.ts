@@ -2,9 +2,16 @@
  * useVoiceRecognition — Speech recognition hook using expo-speech-recognition.
  * Listens for the "MBG" trigger keyword in Indonesian speech.
  * Provides continuous listening with automatic restart after processing.
+ *
+ * Lifecycle safety:
+ * - hardCleanup() guarantees full recognition teardown
+ * - AppState listener stops mic on background/termination
+ * - Unmount cleanup prevents ghost recognition
+ * - Restart timer is tracked and cleared deterministically
  */
 
-import { useState, useCallback, useRef } from "react";
+import { useState, useCallback, useRef, useEffect } from "react";
+import { AppState } from "react-native";
 import * as Speech from "expo-speech";
 import {
   ExpoSpeechRecognitionModule,
@@ -43,14 +50,92 @@ export default function useVoiceRecognition(): UseVoiceRecognitionReturn {
   // Track if user manually stopped — prevents auto-restart in "end" handler
   // Once set to true, ONLY startListening() resets this flag
   const manualStopRef = useRef(false);
+  // Track the restart setTimeout so it can be cleared deterministically
+  const restartTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Track whether the app is in the foreground — blocks restarts when backgrounded
+  const appIsActiveRef = useRef(true);
+
+  // ─── Hard Cleanup ───────────────────────────────────────────────────────
+
+  /**
+   * Deterministic full teardown of recognition.
+   * Stops recognition, clears timers, disables restarts.
+   * Safe to call multiple times — idempotent.
+   */
+  const hardCleanup = useCallback(() => {
+    console.log("[MBG:Voice] Hard cleanup — start");
+
+    // 1. Block all restarts
+    manualStopRef.current = true;
+    isProcessingRef.current = false;
+
+    // 2. Clear pending restart timer
+    if (restartTimerRef.current) {
+      clearTimeout(restartTimerRef.current);
+      restartTimerRef.current = null;
+      console.log("[MBG:Voice] Restart timer cleared");
+    }
+
+    // 3. Abort recognition immediately
+    try {
+      ExpoSpeechRecognitionModule.abort();
+      console.log("[MBG:Voice] Recognition aborted");
+    } catch {
+      // Already stopped or never started — safe to ignore
+    }
+
+    // 4. Update state
+    setIsListening(false);
+
+    console.log("[MBG:Voice] Hard cleanup — complete");
+  }, []);
+
+  // ─── AppState Lifecycle Listener ────────────────────────────────────────
+
+  useEffect(() => {
+    const handleAppStateChange = (nextState: string) => {
+      console.log("[MBG:Voice] AppState changed:", nextState);
+
+      if (nextState === "active") {
+        appIsActiveRef.current = true;
+        // Do NOT auto-restart here — user must press "Start" again
+      } else {
+        // background, inactive, or unknown — stop everything
+        appIsActiveRef.current = false;
+        console.log("[MBG:Voice] App not active — running hard cleanup");
+        hardCleanup();
+      }
+    };
+
+    const subscription = AppState.addEventListener("change", handleAppStateChange);
+
+    return () => {
+      subscription.remove();
+      console.log("[MBG:Voice] AppState listener removed");
+    };
+  }, [hardCleanup]);
+
+  // ─── Unmount Cleanup ────────────────────────────────────────────────────
+
+  useEffect(() => {
+    return () => {
+      console.log("[MBG:Voice] Component unmounting — running hard cleanup");
+      hardCleanup();
+    };
+  }, [hardCleanup]);
 
   // ─── Safe Start Wrapper ───────────────────────────────────────────────────
 
   /**
-   * Attempt to start recognition ONLY if not processing and not manually stopped.
-   * This is the single entry point for all auto-restarts.
+   * Attempt to start recognition ONLY if not processing, not manually stopped,
+   * and the app is in the foreground. This is the single entry point for all
+   * auto-restarts.
    */
   const startRecognitionSafe = useCallback(async () => {
+    if (!appIsActiveRef.current) {
+      console.log("[MBG:Voice] Restart blocked — app not active");
+      return;
+    }
     if (isProcessingRef.current) {
       console.log("[MBG:Voice] Restart blocked — processing in progress");
       return;
@@ -97,13 +182,28 @@ export default function useVoiceRecognition(): UseVoiceRecognitionReturn {
     console.log("[MBG:Voice] Recognition ended", {
       isProcessing: isProcessingRef.current,
       manualStop: manualStopRef.current,
+      appIsActive: appIsActiveRef.current,
     });
     setIsListening(false);
 
-    // Auto-restart ONLY if not processing AND user didn't manually stop
-    if (!isProcessingRef.current && !manualStopRef.current) {
+    // Auto-restart ONLY if all conditions are met
+    if (
+      !isProcessingRef.current &&
+      !manualStopRef.current &&
+      appIsActiveRef.current
+    ) {
       // Small delay to avoid race with TTS starting
-      setTimeout(() => startRecognitionSafe(), 300);
+      // Store the timer ref so it can be cleared during cleanup
+      restartTimerRef.current = setTimeout(() => {
+        restartTimerRef.current = null;
+        startRecognitionSafe();
+      }, 300);
+    } else {
+      console.log("[MBG:Voice] Auto-restart blocked", {
+        isProcessing: isProcessingRef.current,
+        manualStop: manualStopRef.current,
+        appIsActive: appIsActiveRef.current,
+      });
     }
   });
 
@@ -171,14 +271,26 @@ export default function useVoiceRecognition(): UseVoiceRecognitionReturn {
   /**
    * Stop listening — user-initiated.
    * Sets manual stop flag BEFORE aborting to prevent auto-restart in "end" handler.
+   * Also clears any pending restart timer.
    */
   const stopListening = useCallback(() => {
     console.log("[MBG:Voice] Manual stop requested");
     manualStopRef.current = true;
     isProcessingRef.current = false;
 
+    // Clear pending restart timer — prevent restart during the 300ms window
+    if (restartTimerRef.current) {
+      clearTimeout(restartTimerRef.current);
+      restartTimerRef.current = null;
+      console.log("[MBG:Voice] Pending restart timer cleared");
+    }
+
     // Use abort() for immediate, forceful termination
-    ExpoSpeechRecognitionModule.abort();
+    try {
+      ExpoSpeechRecognitionModule.abort();
+    } catch {
+      // Already stopped — safe to ignore
+    }
     setIsListening(false);
   }, []);
 
@@ -203,11 +315,14 @@ export default function useVoiceRecognition(): UseVoiceRecognitionReturn {
     isProcessingRef.current = false;
     // Do NOT reset manualStopRef — only startListening does that
 
-    // Restart listening only if user hasn't manually stopped
-    if (!manualStopRef.current) {
+    // Restart listening only if user hasn't manually stopped and app is active
+    if (!manualStopRef.current && appIsActiveRef.current) {
       startRecognitionSafe();
     } else {
-      console.log("[MBG:Voice] resetCommand — not restarting, manual stop active");
+      console.log("[MBG:Voice] resetCommand — not restarting", {
+        manualStop: manualStopRef.current,
+        appIsActive: appIsActiveRef.current,
+      });
     }
   }, [startRecognitionSafe]);
 
