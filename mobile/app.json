@@ -1,0 +1,46 @@
+{
+  "expo": {
+    "name": "MBG Assistive Vision",
+    "slug": "mbg-assistive-vision",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "dark",
+    "newArchEnabled": true,
+    "splash": {
+      "image": "./assets/splash-icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#1a1a2e"
+    },
+    "ios": {
+      "supportsTablet": false,
+      "infoPlist": {
+        "NSCameraUsageDescription": "MBG memerlukan akses kamera untuk menganalisis lingkungan sekitar Anda.",
+        "NSMicrophoneUsageDescription": "MBG memerlukan akses mikrofon untuk mendengarkan perintah suara Anda.",
+        "NSSpeechRecognitionUsageDescription": "MBG memerlukan akses pengenalan suara untuk memproses perintah Anda."
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#1a1a2e"
+      },
+      "edgeToEdgeEnabled": true,
+      "permissions": [
+        "CAMERA",
+        "RECORD_AUDIO"
+      ],
+      "package": "com.mbg.assistivevision",
+      "usesCleartextTraffic": true
+    },
+    "plugins": [
+      "expo-speech-recognition",
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "MBG memerlukan akses kamera untuk menganalisis lingkungan sekitar Anda."
+        }
+      ]
+    ]
+  }
+}

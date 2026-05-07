@@ -36,3 +36,14 @@ Thumbs.db
 .cache/
 .eslintcache
 *.tsbuildinfo
+
+# Expo / React Native
+mobile/android/
+mobile/ios/
+.expo/
+*.jks
+*.p8
+*.p12
+*.key
+*.mobileprovision
+*.orig.*
