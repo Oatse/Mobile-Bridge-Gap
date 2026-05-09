@@ -1,0 +1,14 @@
+{
+  "_description": "Map image filenames to expected approximate distance in meters for calibration comparison.",
+  "_usage": "bun run depth-calibrate ./test-images/ --metadata scripts/calibration-metadata.example.json",
+  "_notes": [
+    "Distances are approximate — monocular depth is inherently imprecise.",
+    "Use center-object distance as the reference point.",
+    "Only list images that have known reference distances."
+  ],
+  "chair_05m.jpg": 0.5,
+  "desk_1m.jpg": 1.0,
+  "hallway_3m.jpg": 3.0,
+  "doorway_2m.jpg": 2.0,
+  "table_15m.jpg": 1.5
+}

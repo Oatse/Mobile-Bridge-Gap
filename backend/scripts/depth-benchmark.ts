@@ -1,11 +1,12 @@
 /**
  * Multi-resolution depth estimation benchmark script.
- * Tests 518×518, 384×384, and 256×256 input resolutions.
+ * Tests the Depth-Anything-V2-Metric-Indoor-Small model at multiple resolutions.
  *
  * For each resolution:
  * - 1 cold inference + 3 warm inferences
  * - Measures: preprocessing, inference, total latency
  * - Measures: memory usage (RSS, heap)
+ * - Logs raw metric output ranges (min/max/mean meters)
  * - Compares semantic analysis quality across resolutions
  *
  * Usage:
@@ -28,9 +29,8 @@ const projectRoot = resolve(__dirname, "..");
 const MODEL_FILE = resolve(
   projectRoot,
   "models",
-  "depth-anything-v2-small",
-  "onnx",
-  "model.onnx"
+  "Depth-Anything-V2-Metric-Indoor-Small-hf",
+  "depth_anything_v2_metric_indoor_small.onnx"
 );
 
 // ─── Preprocessing config ───────────────────────────────────────────────────
@@ -41,8 +41,12 @@ const PREPROCESS = {
   rescaleFactor: 0.00392156862745098,
 };
 
-/** Resolutions to benchmark */
-const RESOLUTIONS = [518, 384, 256] as const;
+/**
+ * Resolutions to benchmark.
+ * The metric indoor DPT model REQUIRES 518×518 input (positional embeddings
+ * enforce fixed tensor dimensions). Other resolutions cause ONNX broadcast errors.
+ */
+const RESOLUTIONS = [518] as const;
 
 /** Number of warm inference runs per resolution */
 const WARM_RUNS = 3;
@@ -62,9 +66,12 @@ interface BenchmarkResult {
   outputSize: string;
   memoryRss: string;
   memoryHeap: string;
+  rawMinMeters: number;
+  rawMaxMeters: number;
+  rawMeanMeters: number;
   proximity: string;
   warning: string | null;
-  regions: Array<{ region: string; proximity: string; meanDepth: number }>;
+  regions: Array<{ region: string; proximity: string; meanDepth: number; estimatedDistanceM: number }>;
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -84,6 +91,19 @@ function formatMemory(): { rss: string; heap: string } {
 
 function avg(values: number[]): number {
   return values.reduce((a, b) => a + b, 0) / values.length;
+}
+
+function getDepthStats(data: Float32Array): { min: number; max: number; mean: number } {
+  let min = Infinity;
+  let max = -Infinity;
+  let sum = 0;
+  for (let i = 0; i < data.length; i++) {
+    const v = data[i]!;
+    if (v < min) min = v;
+    if (v > max) max = v;
+    sum += v;
+  }
+  return { min, max, mean: sum / data.length };
 }
 
 // ─── Preprocessing ──────────────────────────────────────────────────────────
@@ -167,13 +187,18 @@ async function benchmarkResolution(
 
   console.log(`  Warm (avg ${WARM_RUNS} runs): preprocess=${warmAvgPreprocessMs.toFixed(0)}ms, inference=${warmAvgInferenceMs.toFixed(0)}ms, total=${warmAvgTotalMs.toFixed(0)}ms`);
 
-  // Semantic analysis
+  // Extract depth output
   const depthOutput = coldOutput.predicted_depth!;
   const depthData = depthOutput.data as Float32Array;
   const dims = depthOutput.dims;
   const outHeight = Number(dims[dims.length - 2]);
   const outWidth = Number(dims[dims.length - 1]);
 
+  // Raw metric statistics
+  const stats = getDepthStats(depthData);
+  console.log(`  Raw metric range: min=${stats.min.toFixed(3)}m, max=${stats.max.toFixed(3)}m, mean=${stats.mean.toFixed(3)}m`);
+
+  // Semantic analysis
   const { analyzeDepthMap } = await import("../src/services/depth/depthAnalysis");
   const analysis = analyzeDepthMap(depthData, outWidth, outHeight, coldTotalMs);
 
@@ -181,7 +206,7 @@ async function benchmarkResolution(
   console.log(`  Proximity: ${analysis.proximity}`);
   console.log(`  Warning: ${analysis.warning ?? "(none — path clear)"}`);
   for (const region of analysis.regions) {
-    console.log(`    ${region.region}: ${region.proximity} (depth: ${region.meanDepth.toFixed(4)})`);
+    console.log(`    ${region.region}: ${region.proximity} (est. ${region.estimatedDistanceM.toFixed(3)}m)`);
   }
 
   const mem = formatMemory();
@@ -200,12 +225,16 @@ async function benchmarkResolution(
     outputSize: `${outWidth}×${outHeight}`,
     memoryRss: mem.rss,
     memoryHeap: mem.heap,
+    rawMinMeters: stats.min,
+    rawMaxMeters: stats.max,
+    rawMeanMeters: stats.mean,
     proximity: analysis.proximity,
     warning: analysis.warning,
     regions: analysis.regions.map((r) => ({
       region: r.region,
       proximity: r.proximity,
       meanDepth: r.meanDepth,
+      estimatedDistanceM: r.estimatedDistanceM,
     })),
   };
 }
@@ -228,15 +257,16 @@ async function runBenchmark(): Promise<void> {
   }
 
   console.log("═══════════════════════════════════════════════════════════");
-  console.log("  MBG Depth Estimation — Multi-Resolution Benchmark");
+  console.log("  MBG Depth Estimation — Metric Indoor Benchmark");
   console.log("═══════════════════════════════════════════════════════════");
-  console.log(`📁 Model: ${MODEL_FILE}`);
+  console.log(`📁 Model: Depth-Anything-V2-Metric-Indoor-Small`);
+  console.log(`📁 ONNX:  ${MODEL_FILE}`);
   console.log(`📷 Image: ${resolvedPath}`);
   console.log(`🔄 Resolutions: ${RESOLUTIONS.join(", ")}`);
   console.log(`🔁 Warm runs per resolution: ${WARM_RUNS}`);
 
   // Load model once
-  console.log("\n🔄 Loading depth model...");
+  console.log("\n🔄 Loading metric depth model...");
   const loadStart = performance.now();
   const session = await ort.InferenceSession.create(MODEL_FILE, {
     executionProviders: ["cpu"],
@@ -247,6 +277,8 @@ async function runBenchmark(): Promise<void> {
   });
   const loadTimeMs = performance.now() - loadStart;
   console.log(`✅ Model loaded in ${loadTimeMs.toFixed(0)}ms`);
+  console.log(`   Inputs: ${session.inputNames.join(", ")}`);
+  console.log(`   Outputs: ${session.outputNames.join(", ")}`);
 
   const imageBuffer = readFileSync(resolvedPath);
   console.log(`📷 Image size: ${formatBytes(imageBuffer.length)}`);
@@ -263,8 +295,8 @@ async function runBenchmark(): Promise<void> {
   console.log("  COMPARISON TABLE");
   console.log("═══════════════════════════════════════════════════════════");
 
-  const header = "| Resolution | Cold Pre | Cold Infer | Cold Total | Warm Pre | Warm Infer | Warm Total | Output | Proximity | Warning |";
-  const divider = "|------------|----------|------------|------------|----------|------------|------------|--------|-----------|---------|";
+  const header = "| Resolution | Cold Pre | Cold Infer | Cold Total | Warm Pre | Warm Infer | Warm Total | Output | Min(m) | Max(m) | Proximity | Warning |";
+  const divider = "|------------|----------|------------|------------|----------|------------|------------|--------|--------|--------|-----------|---------|";
 
   console.log(header);
   console.log(divider);
@@ -279,6 +311,8 @@ async function runBenchmark(): Promise<void> {
       `${r.warmAvgInferenceMs.toFixed(0)}ms`,
       `${r.warmAvgTotalMs.toFixed(0)}ms`,
       r.outputSize,
+      r.rawMinMeters.toFixed(2),
+      r.rawMaxMeters.toFixed(2),
       r.proximity,
       r.warning?.slice(0, 25) ?? "(clear)",
     ];
@@ -294,15 +328,15 @@ async function runBenchmark(): Promise<void> {
   }
 
   // Quality comparison
-  console.log("\n──── Semantic Quality Comparison ────");
+  console.log("\n──── Metric Quality Comparison ────");
   for (const r of results) {
     const matchesBaseline = r.proximity === baseline.proximity;
     const warningMatch = r.warning === baseline.warning;
     console.log(`  ${r.resolution}×${r.resolution}: proximity=${r.proximity} ${matchesBaseline ? "✅" : "⚠️"}, warning=${warningMatch ? "matches" : "DIFFERS"}`);
     for (const region of r.regions) {
       const baseRegion = baseline.regions.find((br) => br.region === region.region);
-      const depthDiff = baseRegion ? Math.abs(region.meanDepth - baseRegion.meanDepth) : 0;
-      console.log(`    ${region.region}: ${region.proximity} (depth: ${region.meanDepth.toFixed(4)}, drift: ${depthDiff.toFixed(4)})`);
+      const depthDiff = baseRegion ? Math.abs(region.estimatedDistanceM - baseRegion.estimatedDistanceM) : 0;
+      console.log(`    ${region.region}: ${region.proximity} (est. ${region.estimatedDistanceM.toFixed(3)}m, drift: ${depthDiff.toFixed(3)}m)`);
     }
   }
 
@@ -310,6 +344,8 @@ async function runBenchmark(): Promise<void> {
   const outputPath = resolve(projectRoot, "scripts", "benchmark-results.json");
   const jsonResults = {
     timestamp: new Date().toISOString(),
+    model: "Depth-Anything-V2-Metric-Indoor-Small",
+    modelType: "metric_indoor",
     image: resolvedPath,
     modelLoadMs: loadTimeMs,
     results,

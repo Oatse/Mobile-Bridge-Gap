@@ -1,19 +1,30 @@
 /**
- * Semantic depth analysis.
- * Converts raw depth maps into human-readable proximity warnings.
+ * Semantic depth analysis for metric indoor model.
+ * Converts raw metric depth maps into human-readable proximity warnings.
  *
- * The depth map is divided into spatial regions (center, left, right).
- * Each region gets a proximity level based on normalized depth values.
- * The center region is prioritized as the primary forward-facing area.
+ * ARCHITECTURE:
+ * The depth map is divided into 9 priority-weighted assistive regions.
+ * Each region gets percentile-based depth analysis instead of mean-only.
+ * The nearest meaningful obstacle is prioritized for assistive narration.
+ *
+ * KEY DESIGN DECISION:
+ * Mean depth suppresses small nearby obstacles (e.g., scissors on floor).
+ * Percentile-based analysis (p5) captures obstacles occupying ≥5% of a region,
+ * while noise protection (obstacle ratio threshold) filters spurious detections.
  *
  * IMPORTANT:
- * - This system performs RELATIVE monocular depth estimation only
- * - Values represent relative proximity, NOT metric distances
- * - Lower depth values = closer objects, higher = farther objects
+ * - This system uses Depth-Anything-V2-Metric-Indoor-Small
+ * - Output values represent APPROXIMATE meters (not exact measurements)
+ * - Lower depth values = closer objects (metric convention)
+ * - Do NOT claim centimeter-level accuracy
+ * - Use bucketed language: "sekitar 1 meter", NOT "1.14 meter"
  */
 
 import {
   DEPTH_PROXIMITY_THRESHOLDS,
+  DEPTH_MAX_DEPTH_M,
+  DEPTH_OBSTACLE_MIN_RATIO,
+  DEPTH_ANALYSIS_PERCENTILE,
 } from "../../utils/constants";
 import { log } from "../../utils/logger";
 import type {
@@ -21,145 +32,377 @@ import type {
   DepthRegion,
   RegionDepth,
   DepthAnalysisResult,
+  ObstacleAlert,
+  NavigationScore,
+  PathOccupancy,
 } from "./types";
 import { PROXIMITY_LABELS } from "./types";
 
 // ─── Region Definitions ─────────────────────────────────────────────────────
 
 /**
- * Defines spatial regions as fractional bounding boxes of the depth map.
- * Values are [xStart, xEnd, yStart, yEnd] as fractions of width/height.
+ * 9 assistive regions with priority weights for indoor navigation.
  *
- * Center = middle 40% horizontally, lower 60% vertically (primary walking zone)
- * Left/Right = side 30% horizontally, lower 60% vertically
+ * Bounds are [xStart, xEnd, yStart, yEnd] as fractions of width/height.
+ * Priority weights reflect safety relevance:
+ * - Lower regions detect floor-level hazards (tripping, stepping)
+ * - Center regions detect forward-path obstacles
+ * - Upper regions are informational only (ceiling, background)
  */
-const REGION_BOUNDS: Record<DepthRegion, [number, number, number, number]> = {
-  center: [0.30, 0.70, 0.40, 1.00],
-  left:   [0.00, 0.30, 0.40, 1.00],
-  right:  [0.70, 1.00, 0.40, 1.00],
+interface RegionConfig {
+  bounds: [number, number, number, number];
+  priority: number;
+}
+
+const REGION_CONFIGS: Record<DepthRegion, RegionConfig> = {
+  // VERY HIGH PRIORITY — floor directly ahead
+  lower_center: { bounds: [0.30, 0.70, 0.70, 1.00], priority: 1.0 },
+  // HIGH PRIORITY — primary walking zone
+  center:       { bounds: [0.30, 0.70, 0.40, 0.70], priority: 0.85 },
+  // MEDIUM PRIORITY — floor sides
+  lower_left:   { bounds: [0.00, 0.30, 0.70, 1.00], priority: 0.75 },
+  lower_right:  { bounds: [0.70, 1.00, 0.70, 1.00], priority: 0.75 },
+  // MEDIUM-LOW PRIORITY — side awareness
+  left:         { bounds: [0.00, 0.30, 0.40, 0.70], priority: 0.5 },
+  right:        { bounds: [0.70, 1.00, 0.40, 0.70], priority: 0.5 },
+  // LOW PRIORITY — background/ceiling
+  upper_center: { bounds: [0.30, 0.70, 0.00, 0.40], priority: 0.3 },
+  upper_left:   { bounds: [0.00, 0.30, 0.00, 0.40], priority: 0.2 },
+  upper_right:  { bounds: [0.70, 1.00, 0.00, 0.40], priority: 0.2 },
 };
+
+/**
+ * Only these regions can trigger safety warnings.
+ * Upper regions are excluded to avoid false alerts from ceilings/walls.
+ */
+const SAFETY_REGIONS: ReadonlySet<DepthRegion> = new Set([
+  "lower_center", "center", "lower_left", "lower_right", "left", "right",
+]);
 
 // ─── Warning Phrase Pools ───────────────────────────────────────────────────
 
 /**
- * Varied phrasing pools for region-aware warnings.
- * Avoids robotic repetition by cycling through natural phrases.
- * Index selection is deterministic based on region depth values.
+ * Obstacle-first warning phrases organized by region position and proximity.
+ * Uses natural, assistive Indonesian with approximate distance language.
  */
-const CENTER_SANGAT_DEKAT_PHRASES = [
-  "Objek sangat dekat di depan",
-  "Ada halangan sangat dekat di depan Anda",
-  "Objek sangat dekat tepat di depan",
-] as const;
+const OBSTACLE_PHRASES: Record<string, readonly string[]> = {
+  // Floor-level obstacles — use semantic categories, not generic "objek"
+  "floor_sangat_dekat": [
+    "Perhatian, ada halangan sangat dekat di lantai depan Anda",
+    "Hati-hati, penghalang di lantai sangat dekat di depan",
+    "Ada benda kecil sangat dekat di lantai, kurang dari setengah meter",
+  ],
+  "floor_dekat": [
+    "Ada halangan di lantai depan Anda, sekitar 1 meter",
+    "Penghalang di lantai depan, sekitar 1 meter",
+    "Terdapat benda kecil di lantai depan Anda, sekitar 1 meter",
+  ],
+  "floor_sedang": [
+    "Ada halangan di lantai depan, sekitar 2 meter",
+    "Terdapat penghalang di lantai depan, sekitar 2 meter",
+  ],
 
-const CENTER_DEKAT_PHRASES = [
-  "Halangan dekat di depan",
-  "Ada objek dekat di depan Anda",
-  "Halangan terdeteksi dekat di depan",
-] as const;
+  // Center walking zone — emphasize path blockage
+  "center_sangat_dekat": [
+    "Halangan sangat dekat di jalur depan, kurang dari setengah meter",
+    "Ada penghalang sangat dekat di jalur depan Anda",
+    "Furnitur sangat dekat tepat di jalur depan, hati-hati",
+  ],
+  "center_dekat": [
+    "Halangan sekitar 1 meter di jalur depan",
+    "Ada penghalang dekat di jalur depan Anda, sekitar 1 meter",
+    "Furnitur terdeteksi dekat di jalur depan",
+  ],
+  "center_sedang": [
+    "Ada halangan sekitar 2 meter di jalur depan",
+    "Penghalang terdeteksi di jalur depan, sekitar 2 meter",
+  ],
 
-const SIDE_SANGAT_DEKAT_PHRASES: Record<"left" | "right", readonly string[]> = {
-  left: [
-    "Objek sangat dekat di kiri",
+  // Side obstacles — use position-aware language
+  "left_sangat_dekat": [
     "Halangan sangat dekat di sisi kiri",
+    "Penghalang sangat dekat di kiri Anda",
   ],
-  right: [
-    "Objek sangat dekat di kanan",
+  "left_dekat": [
+    "Halangan sekitar 1 meter di sisi kiri",
+    "Ada penghalang dekat di sisi kiri",
+  ],
+  "right_sangat_dekat": [
     "Halangan sangat dekat di sisi kanan",
+    "Penghalang sangat dekat di kanan Anda",
   ],
-};
-
-const SIDE_DEKAT_PHRASES: Record<"left" | "right", readonly string[]> = {
-  left: [
-    "Halangan dekat di kiri",
-    "Ada objek dekat di sisi kiri",
-  ],
-  right: [
-    "Halangan dekat di kanan",
-    "Ada objek dekat di sisi kanan",
+  "right_dekat": [
+    "Halangan sekitar 1 meter di sisi kanan",
+    "Ada penghalang dekat di sisi kanan",
   ],
 };
 
 // ─── Depth Map Processing ───────────────────────────────────────────────────
 
 /**
- * Normalizes depth values to 0-1 range.
- * After normalization: 0 = closest, 1 = farthest.
- *
- * Note: Depth-Anything outputs relative depth where lower = farther.
- * We invert this so lower values mean CLOSER objects (more intuitive for
- * proximity warnings).
+ * Clamps depth values to valid range and handles edge cases.
+ * The metric model may output values outside 0-max_depth range.
  */
-function normalizeDepthMap(depthData: Float32Array): Float32Array {
-  let min = Infinity;
-  let max = -Infinity;
-
-  for (let i = 0; i < depthData.length; i++) {
-    const val = depthData[i]!;
-    if (val < min) min = val;
-    if (val > max) max = val;
-  }
-
-  const range = max - min;
-  if (range === 0) {
-    // Uniform depth — return all 0.5 (medium distance)
-    return new Float32Array(depthData.length).fill(0.5);
-  }
-
-  const normalized = new Float32Array(depthData.length);
-  for (let i = 0; i < depthData.length; i++) {
-    // Invert: Depth-Anything raw output has higher = closer
-    // After inversion: 0 = closest, 1 = farthest
-    normalized[i] = 1 - (depthData[i]! - min) / range;
-  }
-
-  log.debug("Depth map normalization", {
-    rawMin: min.toFixed(4),
-    rawMax: max.toFixed(4),
-    rawRange: range.toFixed(4),
-  });
-
-  return normalized;
+function clampDepth(value: number): number {
+  if (!Number.isFinite(value) || value < 0) return 0;
+  if (value > DEPTH_MAX_DEPTH_M) return DEPTH_MAX_DEPTH_M;
+  return value;
 }
 
 /**
- * Extracts the mean depth for a spatial region of the depth map.
+ * Computes comprehensive depth statistics for a spatial region.
+ * Returns mean, percentiles (p5, p10), min, std, and obstacle ratio.
+ *
+ * Key improvement over previous mean-only approach:
+ * - p5 captures small nearby obstacles that barely affect the mean
+ * - obstacleRatio indicates what fraction of the region has "close" depth
+ * - Both together enable reliable obstacle detection with noise protection
  */
-function getRegionMeanDepth(
-  normalizedMap: Float32Array,
+function getRegionDepthStats(
+  depthData: Float32Array,
   width: number,
   height: number,
   bounds: [number, number, number, number]
-): number {
+): {
+  mean: number;
+  p5: number;
+  p10: number;
+  min: number;
+  std: number;
+  obstacleRatio: number;
+} {
   const [xStart, xEnd, yStart, yEnd] = bounds;
   const x0 = Math.floor(xStart * width);
   const x1 = Math.floor(xEnd * width);
   const y0 = Math.floor(yStart * height);
   const y1 = Math.floor(yEnd * height);
 
-  let sum = 0;
-  let count = 0;
-
+  // Collect all clamped depth values in the region
+  const values: number[] = [];
   for (let y = y0; y < y1; y++) {
     for (let x = x0; x < x1; x++) {
-      const idx = y * width + x;
-      sum += normalizedMap[idx]!;
-      count++;
+      values.push(clampDepth(depthData[y * width + x]!));
     }
   }
 
-  return count > 0 ? sum / count : 0.5;
+  if (values.length === 0) {
+    return { mean: DEPTH_MAX_DEPTH_M, p5: DEPTH_MAX_DEPTH_M, p10: DEPTH_MAX_DEPTH_M, min: DEPTH_MAX_DEPTH_M, std: 0, obstacleRatio: 0 };
+  }
+
+  // Sort ascending for percentile extraction
+  values.sort((a, b) => a - b);
+
+  const n = values.length;
+  const min = values[0]!;
+  const p5Idx = Math.floor(n * DEPTH_ANALYSIS_PERCENTILE / 100);
+  const p10Idx = Math.floor(n * 0.10);
+  const p5 = values[Math.min(p5Idx, n - 1)]!;
+  const p10 = values[Math.min(p10Idx, n - 1)]!;
+
+  // Mean and std
+  let sum = 0;
+  for (let i = 0; i < n; i++) sum += values[i]!;
+  const mean = sum / n;
+
+  let sqSum = 0;
+  for (let i = 0; i < n; i++) sqSum += (values[i]! - mean) ** 2;
+  const std = Math.sqrt(sqSum / n);
+
+  // Obstacle ratio: fraction of pixels below "dekat" threshold (1.0m)
+  let closeCount = 0;
+  for (let i = 0; i < n; i++) {
+    if (values[i]! < DEPTH_PROXIMITY_THRESHOLDS.dekat) closeCount++;
+  }
+  const obstacleRatio = closeCount / n;
+
+  return { mean, p5, p10, min, std, obstacleRatio };
 }
 
 /**
- * Maps a normalized depth value (0 = closest, 1 = farthest)
- * to a semantic proximity level.
+ * Maps an estimated meter depth value to a semantic proximity level.
+ * Lower meter value = closer object = more urgent.
  */
-function depthToProximity(meanDepth: number): ProximityLevel {
-  if (meanDepth < DEPTH_PROXIMITY_THRESHOLDS.sangat_dekat) return "sangat_dekat";
-  if (meanDepth < DEPTH_PROXIMITY_THRESHOLDS.dekat) return "dekat";
-  if (meanDepth < DEPTH_PROXIMITY_THRESHOLDS.sedang) return "sedang";
+function depthToProximity(depthMeters: number): ProximityLevel {
+  if (depthMeters < DEPTH_PROXIMITY_THRESHOLDS.sangat_dekat) return "sangat_dekat";
+  if (depthMeters < DEPTH_PROXIMITY_THRESHOLDS.dekat) return "dekat";
+  if (depthMeters < DEPTH_PROXIMITY_THRESHOLDS.sedang) return "sedang";
   return "jauh";
+}
+
+/**
+ * Maps depth to an approximate distance bucket string for narration.
+ */
+function depthToDistanceBucket(depthMeters: number): string {
+  if (depthMeters < 0.5) return "kurang dari setengah meter";
+  if (depthMeters < 0.75) return "sekitar setengah meter";
+  if (depthMeters < 1.25) return "sekitar 1 meter";
+  if (depthMeters < 1.75) return "sekitar 1 setengah meter";
+  if (depthMeters < 2.5) return "sekitar 2 meter";
+  if (depthMeters < 3.5) return "sekitar 3 meter";
+  return "beberapa meter";
+}
+
+// ─── Navigation Scoring ─────────────────────────────────────────────────────
+
+/** Regions considered floor-level (receive floor-contact score boost) */
+const FLOOR_REGIONS: ReadonlySet<DepthRegion> = new Set([
+  "lower_center", "lower_left", "lower_right",
+]);
+
+/** Regions on the direct center walking path (receive center-path boost) */
+const CENTER_PATH_REGIONS: ReadonlySet<DepthRegion> = new Set([
+  "lower_center", "center",
+]);
+
+/**
+ * Calculates a multi-factor navigation importance score for an obstacle.
+ *
+ * Factors:
+ * - distanceScore: 1/depth — closer objects score higher
+ * - regionScore: region priority weight (from REGION_CONFIGS)
+ * - sizeScore: obstacleRatio × 2 — larger obstacles block more path
+ * - floorContactScore: +0.3 for lower_* regions (floor hazards)
+ * - centerPathScore: +0.2 for center/lower_center (direct path)
+ */
+function calculateNavigationScore(
+  region: DepthRegion,
+  depthM: number,
+  priority: number,
+  obstacleRatio: number
+): NavigationScore {
+  const distanceScore = 1 / Math.max(depthM, 0.1);
+  const regionScore = priority;
+  const sizeScore = Math.min(obstacleRatio * 2, 1.0);
+  const floorContactScore = FLOOR_REGIONS.has(region) ? 0.3 : 0;
+  const centerPathScore = CENTER_PATH_REGIONS.has(region) ? 0.2 : 0;
+
+  // Weighted combination: distance is most important, then region, then size
+  const totalScore =
+    distanceScore * 0.4 +
+    regionScore * 0.25 +
+    sizeScore * 0.15 +
+    floorContactScore * 0.1 +
+    centerPathScore * 0.1;
+
+  return {
+    distanceScore,
+    regionScore,
+    sizeScore,
+    floorContactScore,
+    centerPathScore,
+    totalScore,
+  };
+}
+
+// ─── Path Occupancy Analysis ────────────────────────────────────────────────
+
+/**
+ * Analyzes whether the main walking directions are blocked or clear.
+ * Uses obstacle detection results from all safety regions.
+ *
+ * A direction is "blocked" if any of its constituent regions has a
+ * nearby obstacle (p5 proximity ≠ "jauh" AND obstacle ratio above threshold).
+ */
+function analyzePathOccupancy(regions: RegionDepth[]): PathOccupancy {
+  // Helper: check if a region has a meaningful close obstacle
+  const hasObstacle = (regionName: DepthRegion): boolean => {
+    const r = regions.find((x) => x.region === regionName);
+    if (!r) return false;
+    return r.obstacleRatio >= DEPTH_OBSTACLE_MIN_RATIO && depthToProximity(r.p5Depth) !== "jauh";
+  };
+
+  const centerPathBlocked =
+    hasObstacle("lower_center") || hasObstacle("center");
+  const leftPathClear =
+    !hasObstacle("lower_left") && !hasObstacle("left");
+  const rightPathClear =
+    !hasObstacle("lower_right") && !hasObstacle("right");
+
+  // Determine safest direction
+  let safestDirection: PathOccupancy["safestDirection"];
+  let summary: string;
+
+  if (!centerPathBlocked) {
+    safestDirection = "depan";
+    summary = "Jalur depan relatif aman.";
+  } else if (leftPathClear && rightPathClear) {
+    // Center blocked, both sides clear — prefer left (pedestrian convention)
+    safestDirection = "kiri";
+    summary = "Jalur depan terhalang. Sisi kiri dan kanan tampak aman.";
+  } else if (leftPathClear) {
+    safestDirection = "kiri";
+    summary = "Jalur depan terhalang. Sisi kiri tampak lebih aman.";
+  } else if (rightPathClear) {
+    safestDirection = "kanan";
+    summary = "Jalur depan terhalang. Sisi kanan tampak lebih aman.";
+  } else {
+    safestDirection = "tidak ada";
+    summary = "Perhatian, halangan di beberapa arah. Berjalan dengan sangat hati-hati.";
+  }
+
+  return { centerPathBlocked, leftPathClear, rightPathClear, safestDirection, summary };
+}
+
+// ─── Obstacle Detection ─────────────────────────────────────────────────────
+
+/**
+ * Detects the nearest meaningful obstacle across all safety-relevant regions.
+ *
+ * Algorithm:
+ * 1. For each safety region, compute p5 depth (5th percentile)
+ * 2. Require obstacle ratio > DEPTH_OBSTACLE_MIN_RATIO (noise protection)
+ * 3. Calculate navigation importance score (multi-factor)
+ * 4. Return the highest-scoring region as the nearest obstacle
+ *
+ * Navigation score factors: distance urgency, region priority, obstacle size,
+ * floor-contact bonus, center-path bonus.
+ */
+function detectNearestObstacle(
+  regions: RegionDepth[]
+): ObstacleAlert | null {
+  let bestAlert: ObstacleAlert | null = null;
+  let bestScore = 0;
+
+  for (const region of regions) {
+    // Skip non-safety regions (upper background)
+    if (!SAFETY_REGIONS.has(region.region)) continue;
+
+    // Noise protection: require minimum obstacle ratio
+    if (region.obstacleRatio < DEPTH_OBSTACLE_MIN_RATIO) continue;
+
+    // Use p5 for obstacle depth estimation
+    const effectiveDepth = region.p5Depth;
+    const proximity = depthToProximity(effectiveDepth);
+
+    // Only alert for "sangat_dekat", "dekat", or "sedang" obstacles
+    if (proximity === "jauh") continue;
+
+    // Calculate multi-factor navigation importance score
+    const navigationScore = calculateNavigationScore(
+      region.region,
+      effectiveDepth,
+      region.priority,
+      region.obstacleRatio
+    );
+
+    // Legacy score for backward compatibility
+    const score = (1 / Math.max(effectiveDepth, 0.1)) * region.priority;
+
+    if (navigationScore.totalScore > bestScore) {
+      bestScore = navigationScore.totalScore;
+      bestAlert = {
+        region: region.region,
+        depthM: effectiveDepth,
+        proximity,
+        priority: region.priority,
+        distanceBucket: depthToDistanceBucket(effectiveDepth),
+        score,
+        navigationScore,
+      };
+    }
+  }
+
+  return bestAlert;
 }
 
 // ─── Warning Generation ─────────────────────────────────────────────────────
@@ -169,69 +412,121 @@ function depthToProximity(meanDepth: number): ProximityLevel {
  * Ensures consistent output for the same input (no randomness).
  */
 function selectPhrase(phrases: readonly string[], depthValue: number): string {
-  // Use depth value fractional part to deterministically pick a phrase
   const index = Math.floor(Math.abs(depthValue * 1000)) % phrases.length;
   return phrases[index]!;
 }
 
 /**
- * Generates an Indonesian proximity warning based on region analysis.
- * Uses varied phrasing pools to avoid robotic repetition.
- * Returns null if the path appears clear.
+ * Maps a region to a phrase category key for OBSTACLE_PHRASES lookup.
  */
-function generateWarning(regions: RegionDepth[]): string | null {
-  const center = regions.find((r) => r.region === "center");
-  const left = regions.find((r) => r.region === "left");
-  const right = regions.find((r) => r.region === "right");
+function getRegionPhraseCategory(region: DepthRegion): string {
+  if (region === "lower_center" || region === "lower_left" || region === "lower_right") {
+    return "floor";
+  }
+  if (region === "left") return "left";
+  if (region === "right") return "right";
+  return "center";
+}
 
-  // Priority 1: Very close object in center (highest urgency)
-  if (center && center.proximity === "sangat_dekat") {
-    return selectPhrase(CENTER_SANGAT_DEKAT_PHRASES, center.meanDepth);
+/**
+ * Generates an Indonesian proximity warning based on obstacle-first analysis.
+ *
+ * Priority order:
+ * 1. Nearest obstacle alert (from percentile analysis) — if found
+ * 2. General walking-path awareness (from mean-based center check)
+ * 3. Null if path appears clear
+ */
+function generateWarning(
+  regions: RegionDepth[],
+  nearestObstacle: ObstacleAlert | null
+): string | null {
+  // Priority 1: Nearest obstacle detected via percentile analysis
+  if (nearestObstacle) {
+    const category = getRegionPhraseCategory(nearestObstacle.region);
+    const phraseKey = `${category}_${nearestObstacle.proximity}`;
+    const phrases = OBSTACLE_PHRASES[phraseKey];
+
+    if (phrases && phrases.length > 0) {
+      return selectPhrase(phrases, nearestObstacle.depthM);
+    }
+
+    // Fallback: generic obstacle warning with position
+    const positionMap: Partial<Record<DepthRegion, string>> = {
+      lower_center: "di lantai depan",
+      center: "di depan",
+      lower_left: "di lantai kiri",
+      lower_right: "di lantai kanan",
+      left: "di sisi kiri",
+      right: "di sisi kanan",
+    };
+    const position = positionMap[nearestObstacle.region] ?? "di depan";
+    return `Halangan ${PROXIMITY_LABELS[nearestObstacle.proximity]} ${position}`;
   }
 
-  // Priority 2: Close object in center
-  if (center && center.proximity === "dekat") {
-    return selectPhrase(CENTER_DEKAT_PHRASES, center.meanDepth);
+  // Priority 2: Check if any safety region has mean-based close proximity
+  // (catches large obstacles that affect the mean significantly)
+  const centerRegions = regions.filter(
+    (r) => (r.region === "lower_center" || r.region === "center") && r.proximity !== "jauh"
+  );
+  if (centerRegions.length > 0) {
+    const closest = centerRegions.sort((a, b) => a.meanDepth - b.meanDepth)[0]!;
+    if (closest.proximity === "sedang") {
+      const phrases = OBSTACLE_PHRASES["center_sedang"];
+      if (phrases) return selectPhrase(phrases, closest.meanDepth);
+    }
   }
 
-  // Priority 3: Very close object on sides
-  const sideWarnings: string[] = [];
-  if (left && left.proximity === "sangat_dekat") {
-    sideWarnings.push(selectPhrase(SIDE_SANGAT_DEKAT_PHRASES.left, left.meanDepth));
-  }
-  if (right && right.proximity === "sangat_dekat") {
-    sideWarnings.push(selectPhrase(SIDE_SANGAT_DEKAT_PHRASES.right, right.meanDepth));
-  }
-  if (sideWarnings.length > 0) {
-    return sideWarnings.join(", ");
-  }
-
-  // Priority 4: Close objects on sides
-  if (left && left.proximity === "dekat") {
-    sideWarnings.push(selectPhrase(SIDE_DEKAT_PHRASES.left, left.meanDepth));
-  }
-  if (right && right.proximity === "dekat") {
-    sideWarnings.push(selectPhrase(SIDE_DEKAT_PHRASES.right, right.meanDepth));
-  }
-  if (sideWarnings.length > 0) {
-    return sideWarnings.join(", ");
-  }
-
-  // Path appears relatively clear
-  if (center && (center.proximity === "sedang" || center.proximity === "jauh")) {
-    return null; // No warning needed — path is clear
-  }
-
+  // Path appears clear
   return null;
+}
+
+// ─── Diagnostics ────────────────────────────────────────────────────────────
+
+/**
+ * Logs raw depth statistics for diagnostic and calibration purposes.
+ */
+function logDepthStatistics(depthData: Float32Array): number {
+  let min = Infinity;
+  let max = -Infinity;
+  let sum = 0;
+
+  for (let i = 0; i < depthData.length; i++) {
+    const val = depthData[i]!;
+    if (val < min) min = val;
+    if (val > max) max = val;
+    sum += val;
+  }
+
+  const mean = sum / depthData.length;
+
+  log.debug("Metric depth raw statistics", {
+    minMeters: min.toFixed(3),
+    maxMeters: max.toFixed(3),
+    meanMeters: mean.toFixed(3),
+    pixelCount: depthData.length,
+  });
+
+  return mean;
 }
 
 // ─── Main Analysis Function ─────────────────────────────────────────────────
 
 /**
- * Converts a raw depth map into semantic proximity analysis.
+ * Converts a raw metric depth map into semantic proximity analysis
+ * with percentile-based obstacle prioritization.
+ *
  * This is the main entry point for depth interpretation.
  *
- * @param depthData - Raw depth values from the model
+ * For the metric indoor model:
+ * - Raw values are in approximate meters (lower = closer)
+ * - No normalization/inversion needed
+ * - Thresholds are in meters (0.5m, 1.0m, 2.0m)
+ *
+ * Key improvement: uses p5 percentile for obstacle detection instead of mean.
+ * This ensures small nearby objects (e.g., scissors on floor) are detected
+ * even when the scene-wide average depth is large.
+ *
+ * @param depthData - Raw depth values from the metric model (in meters)
  * @param width - Depth map width
  * @param height - Depth map height
  * @param inferenceMs - Time taken for depth inference
@@ -245,44 +540,86 @@ export function analyzeDepthMap(
 ): DepthAnalysisResult {
   const analysisStart = performance.now();
 
-  // Step 1: Normalize depth values to 0-1 range
-  const normalized = normalizeDepthMap(depthData);
+  // Log raw depth statistics and get global mean for scene context
+  const globalMeanDepth = logDepthStatistics(depthData);
 
-  // Step 2: Analyze each spatial region
+  // Analyze each spatial region with percentile statistics
   const regions: RegionDepth[] = (
-    Object.entries(REGION_BOUNDS) as [DepthRegion, [number, number, number, number]][]
-  ).map(([region, bounds]) => {
-    const meanDepth = getRegionMeanDepth(normalized, width, height, bounds);
-    const proximity = depthToProximity(meanDepth);
+    Object.entries(REGION_CONFIGS) as [DepthRegion, RegionConfig][]
+  ).map(([region, config]) => {
+    const stats = getRegionDepthStats(depthData, width, height, config.bounds);
+
+    // Use p5 for proximity classification (obstacle-aware)
+    // Fall back to mean if obstacle ratio is too low (noise protection)
+    const effectiveDepth = stats.obstacleRatio >= DEPTH_OBSTACLE_MIN_RATIO
+      ? stats.p5
+      : stats.mean;
+    const proximity = depthToProximity(effectiveDepth);
 
     log.debug(`Region [${region}]`, {
-      meanDepth: meanDepth.toFixed(4),
+      meanM: stats.mean.toFixed(3),
+      p5M: stats.p5.toFixed(3),
+      p10M: stats.p10.toFixed(3),
+      minM: stats.min.toFixed(3),
+      obstacleRatio: (stats.obstacleRatio * 100).toFixed(2) + "%",
+      effectiveDepth: effectiveDepth.toFixed(3),
       proximity,
-      thresholds: {
-        sangat_dekat: DEPTH_PROXIMITY_THRESHOLDS.sangat_dekat,
-        dekat: DEPTH_PROXIMITY_THRESHOLDS.dekat,
-        sedang: DEPTH_PROXIMITY_THRESHOLDS.sedang,
-      },
+      priority: config.priority,
     });
 
     return {
       region,
       proximity,
-      meanDepth,
+      meanDepth: stats.mean,
+      p5Depth: stats.p5,
+      p10Depth: stats.p10,
+      estimatedDistanceM: effectiveDepth,
+      obstacleRatio: stats.obstacleRatio,
+      priority: config.priority,
     };
   });
 
-  // Step 3: Determine overall proximity (based on center region)
-  const centerRegion = regions.find((r) => r.region === "center");
-  const overallProximity: ProximityLevel = centerRegion?.proximity ?? "sedang";
+  // Detect nearest meaningful obstacle using navigation-scored percentile analysis
+  const nearestObstacle = detectNearestObstacle(regions);
 
-  // Step 4: Generate warning message
-  const warning = generateWarning(regions);
+  // Analyze path occupancy for navigation guidance
+  const pathOccupancy = analyzePathOccupancy(regions);
+
+  // Determine overall proximity:
+  // If obstacle detected → use obstacle proximity (safety-first)
+  // Otherwise → use center region mean proximity (scene-level)
+  const overallProximity: ProximityLevel = nearestObstacle
+    ? nearestObstacle.proximity
+    : (regions.find((r) => r.region === "lower_center")?.proximity ??
+       regions.find((r) => r.region === "center")?.proximity ??
+       "sedang");
+
+  // Generate warning message with obstacle-first prioritization
+  const warning = generateWarning(regions, nearestObstacle);
 
   const analysisMs = performance.now() - analysisStart;
 
+  // Build debug stats for calibration scripts
+  const debugStats = {
+    globalMeanDepth,
+    classificationMethod: (nearestObstacle ? "percentile" : "mean") as "percentile" | "mean",
+    regionDetails: regions.map((r) => ({
+      region: r.region,
+      meanDepth: r.meanDepth,
+      p5Depth: r.p5Depth,
+      obstacleRatio: r.obstacleRatio,
+      hasObstacle: r.obstacleRatio >= DEPTH_OBSTACLE_MIN_RATIO && depthToProximity(r.p5Depth) !== "jauh",
+    })),
+  };
+
   log.debug("Depth analysis summary", {
     overallProximity,
+    label: PROXIMITY_LABELS[overallProximity],
+    nearestObstacle: nearestObstacle
+      ? `${nearestObstacle.region} @ ${nearestObstacle.depthM.toFixed(3)}m (${nearestObstacle.proximity}) navScore=${nearestObstacle.navigationScore.totalScore.toFixed(3)}`
+      : "(none)",
+    pathOccupancy: pathOccupancy.summary,
+    classificationMethod: debugStats.classificationMethod,
     warning: warning ?? "(path clear)",
     analysisMs: analysisMs.toFixed(2),
   });
@@ -291,6 +628,9 @@ export function analyzeDepthMap(
     proximity: overallProximity,
     warning,
     regions,
+    nearestObstacle,
+    pathOccupancy,
     processingMs: inferenceMs + analysisMs,
+    debugStats,
   };
 }

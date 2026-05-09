@@ -39,34 +39,63 @@ const INTENT_PATTERNS: { keywords: string[]; intent: CommandIntent }[] = [
   },
 ];
 
-// ─── Intent → English Prompt Mapping ────────────────────────────────────────
-
 /**
  * Intent → English prompt mapping.
  * English prompts work better with most vision models.
  * The system prompt instructs the model to respond in Indonesian.
+ *
+ * Each prompt enforces:
+ * - Specific object naming (kursi, meja, pisau — NOT "objek" or "benda")
+ * - Navigation-first priority (floor hazards > path blockage > sides)
+ * - Path safety assessment
+ * - Confidence-aware language for uncertain identifications
  */
 const INTENT_PROMPTS: Record<CommandIntent, string> = {
   general_description:
-    "Describe what is directly in front of the visually impaired user. Focus on nearby obstacles, objects, and safe walking direction. Respond in 1-2 short sentences. Prioritize safety information.",
+    "Describe what is directly in the walking path of the visually impaired user. " +
+    "Name every obstacle by its specific type (chair, table, knife, cable, box, shoes — never say 'object' or 'thing'). " +
+    "Report floor-level hazards first. Include approximate position (left, right, front, floor). " +
+    "End with path safety: is the forward path clear or blocked? If blocked, suggest the safest direction. " +
+    "Respond in 1-2 short sentences. Navigation safety only, no room aesthetics.",
 
   danger_detection:
-    "Identify any dangerous objects, obstacles, or hazards in front of the visually impaired user. Check for sharp objects, holes, moving vehicles, stairs, wet surfaces, or anything that could cause harm. Prioritize immediate threats. Respond in 1-2 short sentences.",
+    "Identify any dangerous or sharp objects in front of the visually impaired user. " +
+    "Name each hazard specifically: knife (pisau), scissors (gunting), broken glass (pecahan kaca), exposed cable (kabel), wet floor (lantai basah), sharp metal, stairs (tangga). " +
+    "Floor-level dangerous items are highest priority. " +
+    "If no danger is found, state the path appears safe. " +
+    "Respond in 1-2 short sentences. Be specific about object identity — never say just 'dangerous object'.",
 
   path_safety:
-    "Analyze whether the walking path ahead is safe and unobstructed for a visually impaired user. Report any obstacles blocking the path, uneven surfaces, stairs, or hazards. Suggest the safest direction to walk. Respond in 1-2 short sentences.",
+    "Analyze the walking path ahead for a visually impaired user. " +
+    "Identify specific objects blocking the center walking path (name each: chair, table, box, etc.). " +
+    "Assess: is the center path passable? Is the left side clear? Is the right side clear? " +
+    "Suggest the safest walking direction. " +
+    "If path is completely clear, state it is safe. " +
+    "Respond in 1-2 short sentences. Focus only on navigation obstacles, not room description.",
 
   people_detection:
-    "Identify any people visible near the visually impaired user. Describe their approximate position (left, right, front) and distance. Do not describe appearance in detail. Respond in 1-2 short sentences.",
+    "Identify any people visible near the visually impaired user. " +
+    "Describe their approximate position (left, right, front) and distance. " +
+    "If they are in the walking path, mention it as a potential obstacle. " +
+    "Do not describe appearance in detail. Respond in 1-2 short sentences.",
 
   area_description:
-    "Describe the surrounding environment for a visually impaired user. Focus on the type of space (indoor/outdoor), key landmarks, exits, obstacles, and safe navigation paths. Respond in 1-2 short sentences.",
+    "Describe the surrounding environment for navigation purposes only. " +
+    "Focus on: doors (pintu), stairs (tangga), exits, corridors, walls, floor type. " +
+    "Mention any navigation-relevant obstacles by name. " +
+    "Do NOT describe room aesthetics, lighting, or decorations. " +
+    "Respond in 1-2 short sentences prioritizing navigation landmarks.",
 
   object_identification:
-    "Identify and describe the main objects visible to the visually impaired user. Focus on objects that are close and could affect movement or safety. Describe their position relative to the user. Respond in 1-2 short sentences.",
+    "Identify and name the main objects visible to the visually impaired user. " +
+    "Name each object specifically: chair (kursi), table (meja), cabinet (lemari), sofa, shelf (rak), fan (kipas), television (televisi), bag (tas), shoes (sepatu), bottle (botol). " +
+    "For each object, state its position relative to the user and whether it is on the floor or at height. " +
+    "Prioritize objects closest to the walking path. " +
+    "Never use generic terms like 'object' or 'thing'. Respond in 1-2 short sentences.",
 
   text_reading:
-    "Read and transcribe any visible text, signs, or labels in the image for the visually impaired user. Include the text content and describe where the text is located. Respond in 1-2 short sentences.",
+    "Read and transcribe any visible text, signs, or labels in the image for the visually impaired user. " +
+    "Include the text content and describe where the text is located. Respond in 1-2 short sentences.",
 };
 
 // ─── Response Sanitization ──────────────────────────────────────────────────

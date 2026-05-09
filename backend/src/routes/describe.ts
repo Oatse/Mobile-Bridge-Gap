@@ -7,6 +7,7 @@
  * - Depth failure is non-fatal — falls back to Gemma-only response
  * - Gemma failure uses existing error handling
  * - Depth estimation can be disabled entirely via ENABLE_DEPTH_ESTIMATION=false
+ * - Temporal stabilization runs as synchronous post-processing after fusion
  */
 
 import { Elysia, t } from "elysia";
@@ -14,11 +15,12 @@ import { validateImage, validateUserCommand } from "../utils/validation";
 import { buildPromptFromCommand, sanitizeResponse } from "../services/promptBuilder";
 import { analyzeImage } from "../services/lmStudio";
 import { estimateDepth } from "../services/depth/depthInference";
-import { fuseGemmaWithDepth } from "../services/depth/responseFusion";
+import { fuseGemmaWithDepth, extractObjectIdentity } from "../services/depth/responseFusion";
 import { FALLBACK_RESPONSE, ENABLE_DEPTH_ESTIMATION } from "../utils/constants";
 import { log } from "../utils/logger";
 import type { DescribeResponse, ErrorResponse } from "../types";
 import type { DepthAnalysisResult } from "../services/depth/types";
+import { stabilizeResponse } from "../services/depth/temporalStabilizer";
 
 // ─── Route Handler ──────────────────────────────────────────────────────────
 
@@ -86,19 +88,36 @@ export const describeRoute = new Elysia().post(
       const sanitizedDescription = sanitizeResponse(rawDescription);
 
       // Fuse Gemma description with depth proximity data
-      const { description, depth } = fuseGemmaWithDepth(sanitizedDescription, depthResult);
+      const { description: fusedDescription, depth } = fuseGemmaWithDepth(sanitizedDescription, depthResult);
+
+      // Temporal stabilization — synchronous post-processing (<3ms)
+      const stabilized = stabilizeResponse(
+        fusedDescription,
+        sanitizedDescription,
+        depthResult
+      );
+
+      // Use stabilized description if narration is allowed, otherwise use previous stable
+      const finalDescription = stabilized.shouldNarrate
+        ? stabilized.description
+        : stabilized.description; // stability layer already handles fallback
 
       const durationMs = performance.now() - startTime;
       log.request("POST", "/describe", durationMs, 200);
-      log.info("Response fused", {
+      log.info("Response stabilized", {
         hasDepth: !!depth,
         proximity: depth?.proximity ?? "unavailable",
+        shouldNarrate: stabilized.shouldNarrate,
+        severity: stabilized.severity,
+        stabilizedObject: stabilized.stabilizedObject ?? "(none)",
+        confidence: stabilized.confidence.totalScore.toFixed(3),
+        stabilizationMs: stabilized.stabilizationMs.toFixed(1),
         totalMs: durationMs.toFixed(0),
       });
 
       return {
         success: true,
-        description,
+        description: finalDescription,
         ...(depth && { depth }),
       } satisfies DescribeResponse;
     } catch (error) {

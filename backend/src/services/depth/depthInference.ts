@@ -2,17 +2,20 @@
  * Depth inference execution using onnxruntime-node.
  * Handles image preprocessing, ONNX tensor creation, and inference.
  *
+ * Uses Depth-Anything-V2-Metric-Indoor-Small for approximate meter estimation.
+ *
  * Preprocessing pipeline:
  * 1. Decode image → resize to configured input size (default 518x518)
  * 2. Extract raw RGB pixel data
  * 3. Normalize with ImageNet mean/std
  * 4. Reshape to NCHW format (batch, channels, height, width)
- * 5. Run ONNX inference
+ * 5. Run ONNX inference → output in approximate meters
  *
  * IMPORTANT:
  * - Uses sharp for image preprocessing (already a project dependency)
  * - Failures are caught and returned as null — never thrown
  * - Depth inference is supplementary; it must not break the primary Gemma pipeline
+ * - Output values represent approximate meters, NOT exact measurements
  */
 
 import * as ort from "onnxruntime-node";
@@ -154,10 +157,21 @@ export async function estimateDepth(
     const outHeight = Number(outputDims[outputDims.length - 2]);
     const outWidth = Number(outputDims[outputDims.length - 1]);
 
-    log.info("Depth inference complete", {
+    // Log raw value range for calibration diagnostics
+    let rawMin = Infinity;
+    let rawMax = -Infinity;
+    for (let i = 0; i < depthData.length; i++) {
+      const v = depthData[i]!;
+      if (v < rawMin) rawMin = v;
+      if (v > rawMax) rawMax = v;
+    }
+
+    log.info("Depth inference complete (metric)", {
       preprocessMs: preprocessMs.toFixed(0),
       inferenceMs: inferenceMs.toFixed(0),
       mapSize: `${outWidth}x${outHeight}`,
+      rawMinMeters: rawMin.toFixed(3),
+      rawMaxMeters: rawMax.toFixed(3),
     });
 
     log.debug("Depth inference timing breakdown", {

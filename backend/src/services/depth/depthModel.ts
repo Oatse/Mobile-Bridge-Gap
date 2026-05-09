@@ -1,19 +1,20 @@
 /**
  * Depth model singleton loader.
- * Loads Depth-Anything-V2-Small ONNX model ONCE during startup.
- * Uses onnxruntime-node for native CPU inference (avoids WASM crashes in Bun).
+ * Loads Depth-Anything-V2-Metric-Indoor-Small ONNX model ONCE during startup.
+ * Uses onnxruntime-node for native CPU inference (avoids VRAM contention with LM Studio).
  *
  * IMPORTANT:
  * - No remote model downloads — loads from local filesystem only
  * - Model loaded from backend/models/ directory
  * - Singleton pattern — session created once, reused for all requests
  * - CPU execution only — avoids VRAM contention with LM Studio
+ * - Metric indoor model outputs approximate depth in meters (0–20m range)
  */
 
 import * as ort from "onnxruntime-node";
 import { resolve } from "path";
 import { existsSync } from "fs";
-import { DEPTH_MODEL_ID, DEPTH_MODEL_PATH, DEPTH_INPUT_SIZE } from "../../utils/constants";
+import { DEPTH_MODEL_ID, DEPTH_MODEL_PATH, DEPTH_INPUT_SIZE, DEPTH_ONNX_FILENAME } from "../../utils/constants";
 import { log } from "../../utils/logger";
 
 // ─── Model Configuration ────────────────────────────────────────────────────
@@ -22,8 +23,7 @@ import { log } from "../../utils/logger";
 const MODEL_FILE = resolve(
   DEPTH_MODEL_PATH,
   DEPTH_MODEL_ID,
-  "onnx",
-  "model.onnx"
+  DEPTH_ONNX_FILENAME
 );
 
 /**

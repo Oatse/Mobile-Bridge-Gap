@@ -1,7 +1,7 @@
 /**
  * Standalone depth estimation test script.
- * Validates that the depth model loads and runs inference correctly
- * BEFORE integrating into the /describe endpoint.
+ * Validates that the Depth-Anything-V2-Metric-Indoor-Small model loads
+ * and runs inference correctly BEFORE integrating into the /describe endpoint.
  *
  * Uses onnxruntime-node directly (matches production implementation).
  *
@@ -25,9 +25,8 @@ const projectRoot = resolve(__dirname, "..");
 const MODEL_FILE = resolve(
   projectRoot,
   "models",
-  "depth-anything-v2-small",
-  "onnx",
-  "model.onnx"
+  "Depth-Anything-V2-Metric-Indoor-Small-hf",
+  "depth_anything_v2_metric_indoor_small.onnx"
 );
 
 // ─── Preprocessing config (matches preprocessor_config.json) ────────────────
@@ -107,7 +106,7 @@ async function runDepthTest(): Promise<void> {
   }
 
   console.log("═══════════════════════════════════════════════════════════");
-  console.log("  MBG Depth Estimation Test (onnxruntime-node)");
+  console.log("  MBG Depth Estimation Test — Metric Indoor (onnxruntime-node)");
   console.log("═══════════════════════════════════════════════════════════");
   console.log(`📁 Model: ${MODEL_FILE}`);
   console.log(`📷 Image: ${resolvedPath}`);
@@ -182,10 +181,10 @@ async function runDepthTest(): Promise<void> {
   }
   const mean = sum / depthData.length;
 
-  console.log(`   Min: ${min.toFixed(4)}`);
-  console.log(`   Max: ${max.toFixed(4)}`);
-  console.log(`   Mean: ${mean.toFixed(4)}`);
-  console.log(`   Range: ${(max - min).toFixed(4)}`);
+  console.log(`   Min: ${min.toFixed(4)}m`);
+  console.log(`   Max: ${max.toFixed(4)}m`);
+  console.log(`   Mean: ${mean.toFixed(4)}m`);
+  console.log(`   Range: ${(max - min).toFixed(4)}m`);
 
   // Step 5: Run semantic analysis
   console.log("\n🔄 Running semantic analysis...");
@@ -198,7 +197,7 @@ async function runDepthTest(): Promise<void> {
   console.log(`   Processing time: ${analysis.processingMs.toFixed(0)}ms`);
   console.log(`\n   Regions:`);
   for (const region of analysis.regions) {
-    console.log(`     ${region.region}: ${region.proximity} (depth: ${region.meanDepth.toFixed(3)})`);
+    console.log(`     ${region.region}: ${region.proximity} (est. ${region.estimatedDistanceM.toFixed(3)}m)`);
   }
 
   // Step 6: Warm inference
