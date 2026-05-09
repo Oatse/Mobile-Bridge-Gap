@@ -52,46 +52,51 @@ const INTENT_PATTERNS: { keywords: string[]; intent: CommandIntent }[] = [
  */
 const INTENT_PROMPTS: Record<CommandIntent, string> = {
   general_description:
-    "Describe what is directly in the walking path of the visually impaired user. " +
-    "Name every obstacle by its specific type (chair, table, knife, cable, box, shoes — never say 'object' or 'thing'). " +
+    "Describe what you actually see in the walking path of the visually impaired user. " +
+    "If any person is visible, mention them first with their position and activity. " +
+    "Name every obstacle by its specific type — never say 'object' or 'thing'. " +
     "Report floor-level hazards first. Include approximate position (left, right, front, floor). " +
-    "End with path safety: is the forward path clear or blocked? If blocked, suggest the safest direction. " +
-    "Respond in 1-2 short sentences. Navigation safety only, no room aesthetics.",
+    "End with path safety: is the forward path clear or blocked? " +
+    "Do NOT list objects that are not visible. Respond in 1-2 short sentences.",
 
   danger_detection:
     "Identify any dangerous or sharp objects in front of the visually impaired user. " +
-    "Name each hazard specifically: knife (pisau), scissors (gunting), broken glass (pecahan kaca), exposed cable (kabel), wet floor (lantai basah), sharp metal, stairs (tangga). " +
+    "Name each hazard specifically (e.g., knife, scissors, broken glass, exposed cable, wet floor, stairs). " +
     "Floor-level dangerous items are highest priority. " +
+    "If any person is near a hazard, mention them. " +
     "If no danger is found, state the path appears safe. " +
-    "Respond in 1-2 short sentences. Be specific about object identity — never say just 'dangerous object'.",
+    "Respond in 1-2 short sentences. Be specific — never say just 'dangerous object'.",
 
   path_safety:
     "Analyze the walking path ahead for a visually impaired user. " +
-    "Identify specific objects blocking the center walking path (name each: chair, table, box, etc.). " +
+    "Name specific objects blocking the center walking path. " +
+    "If any person is in the path, mention them as an entity, not an obstacle. " +
     "Assess: is the center path passable? Is the left side clear? Is the right side clear? " +
     "Suggest the safest walking direction. " +
-    "If path is completely clear, state it is safe. " +
-    "Respond in 1-2 short sentences. Focus only on navigation obstacles, not room description.",
+    "Respond in 1-2 short sentences. Focus only on navigation, not room description.",
 
   people_detection:
     "Identify any people visible near the visually impaired user. " +
     "Describe their approximate position (left, right, front) and distance. " +
-    "If they are in the walking path, mention it as a potential obstacle. " +
+    "Mention their activity if visible (sitting, standing, walking). " +
+    "If they are in the walking path, mention it as awareness, not as an obstacle. " +
     "Do not describe appearance in detail. Respond in 1-2 short sentences.",
 
   area_description:
     "Describe the surrounding environment for navigation purposes only. " +
-    "Focus on: doors (pintu), stairs (tangga), exits, corridors, walls, floor type. " +
+    "Focus on: doors, stairs, exits, corridors, walls, floor type. " +
+    "If any person is visible, mention them with position. " +
     "Mention any navigation-relevant obstacles by name. " +
     "Do NOT describe room aesthetics, lighting, or decorations. " +
     "Respond in 1-2 short sentences prioritizing navigation landmarks.",
 
   object_identification:
-    "Identify and name the main objects visible to the visually impaired user. " +
-    "Name each object specifically: chair (kursi), table (meja), cabinet (lemari), sofa, shelf (rak), fan (kipas), television (televisi), bag (tas), shoes (sepatu), bottle (botol). " +
-    "For each object, state its position relative to the user and whether it is on the floor or at height. " +
-    "Prioritize objects closest to the walking path. " +
-    "Never use generic terms like 'object' or 'thing'. Respond in 1-2 short sentences.",
+    "Identify and describe the main entities visible to the visually impaired user. " +
+    "Name each entity specifically — use the actual name, not generic terms like 'object' or 'thing'. " +
+    "If any person is visible, mention them first. " +
+    "For each entity, state its position relative to the user and whether it is on the floor or at height. " +
+    "Prioritize entities closest to the walking path. " +
+    "Do NOT list objects that are not visible. Respond in 1-2 short sentences.",
 
   text_reading:
     "Read and transcribe any visible text, signs, or labels in the image for the visually impaired user. " +

@@ -3,8 +3,8 @@
  * Supports single image, batch directory, metadata comparison,
  * threshold recommendation, assistive validation, and debug visualization.
  *
- * Now includes percentile-based analysis and mean vs percentile comparison
- * to validate the obstacle prioritization improvement.
+ * --validate mode calls REAL Gemma inference via LM Studio for full-pipeline
+ * narration testing (Gemma vision + Depth fusion) without needing the mobile app.
  *
  * Usage:
  *   bun run depth-calibrate <image-or-directory> [options]
@@ -12,28 +12,36 @@
  * Options:
  *   --thresholds 0.5,1.0,2.0    Custom proximity thresholds (meters)
  *   --metadata <json-file>       Expected distance metadata for comparison
- *   --validate                   Show assistive narration output
+ *   --validate                   Run full pipeline: Gemma + Depth + Fusion
+ *   --command "text"             User command for Gemma (default: general description)
  *   --debug                      Show ASCII depth grid visualization
  *   --recommend                  Show threshold adjustment recommendations
  *   --output <file>              Custom JSON output path
  *
  * Examples:
- *   bun run depth-calibrate scripts/test-images/test-image.png
- *   bun run depth-calibrate scripts/test-images/
- *   bun run depth-calibrate scripts/test-images/ --metadata calibration-metadata.json --recommend
+ *   bun run depth-calibrate scripts/test-images/test-image.png --validate
+ *   bun run depth-calibrate scripts/test-images/test-image.png --validate --command "apakah ada bahaya"
+ *   bun run depth-calibrate scripts/test-images/ --validate --command "apakah jalur depan aman"
  *   bun run depth-calibrate scripts/test-images/test-image.png --validate --debug
  */
 
 import * as ort from "onnxruntime-node";
+import sharp from "sharp";
 import { basename } from "path";
 import { readFileSync, writeFileSync } from "fs";
-import { DEPTH_PROXIMITY_THRESHOLDS } from "../src/utils/constants";
+import {
+  DEPTH_PROXIMITY_THRESHOLDS,
+  LM_STUDIO_URL, LM_STUDIO_MODEL, SYSTEM_PROMPT,
+  IMAGE_MAX_DIMENSION, IMAGE_QUALITY,
+  MAX_OUTPUT_TOKENS, INFERENCE_TEMPERATURE,
+} from "../src/utils/constants";
+import { buildPromptFromCommand, sanitizeResponse } from "../src/services/promptBuilder";
 import {
   MODEL_FILE, REGION_BOUNDS, REGION_PRIORITIES, SAFETY_REGIONS,
   type Thresholds, type RegionResult, type ImageCalibrationResult, type CLIOptions,
   preprocessImage, getRegionStats, classifyDepth, generateHistogram,
   generateAsciiDepthGrid, parseCLI, discoverImages, formatMemory,
-  detectNearestObstacle, depthToDistanceBucket,
+  detectNearestObstacle, depthToDistanceBucket, analyzePathOccupancy,
 } from "./calibration-utils";
 
 // ─── Production Thresholds (from constants.ts) ──────────────────────────────
@@ -43,6 +51,63 @@ const PRODUCTION_THRESHOLDS: Thresholds = {
   dekat: DEPTH_PROXIMITY_THRESHOLDS.dekat,
   sedang: DEPTH_PROXIMITY_THRESHOLDS.sedang,
 };
+
+// ─── Real Gemma Inference via LM Studio ─────────────────────────────────────
+
+/**
+ * Optimizes image for Gemma inference (matches production lmStudio.ts).
+ * Resizes to IMAGE_MAX_DIMENSION and compresses to JPEG.
+ */
+async function optimizeImageForGemma(imageBuffer: Buffer): Promise<string> {
+  const optimized = await sharp(imageBuffer)
+    .resize(IMAGE_MAX_DIMENSION, IMAGE_MAX_DIMENSION, {
+      fit: "inside",
+      withoutEnlargement: true,
+    })
+    .jpeg({ quality: IMAGE_QUALITY })
+    .toBuffer();
+  return `data:image/jpeg;base64,${optimized.toString("base64")}`;
+}
+
+/**
+ * Calls real Gemma via LM Studio API.
+ * Returns the raw description string, or null if LM Studio is unavailable.
+ */
+async function callGemma(imageBuffer: Buffer, userCommand: string): Promise<{ raw: string; sanitized: string } | null> {
+  try {
+    const dataUrl = await optimizeImageForGemma(imageBuffer);
+    const prompt = buildPromptFromCommand(userCommand);
+
+    const response = await fetch(`${LM_STUDIO_URL}/api/v1/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: LM_STUDIO_MODEL,
+        input: [
+          { type: "text", content: prompt },
+          { type: "image", data_url: dataUrl },
+        ],
+        system_prompt: SYSTEM_PROMPT,
+        temperature: INFERENCE_TEMPERATURE,
+        max_output_tokens: MAX_OUTPUT_TOKENS,
+        store: false,
+      }),
+      signal: AbortSignal.timeout(30_000),
+    });
+
+    if (!response.ok) return null;
+
+    const data = await response.json() as any;
+    const messageItem = data?.output?.find?.((item: any) => item.type === "message");
+    const content = messageItem?.content?.trim();
+    if (!content || content.length === 0) return null;
+
+    // Return BOTH raw and sanitized for debugging
+    return { raw: content, sanitized: sanitizeResponse(content) };
+  } catch {
+    return null;
+  }
+}
 
 // ─── Single Image Calibration ───────────────────────────────────────────────
 
@@ -119,6 +184,10 @@ async function calibrateImage(
     result.closestRegion = sorted[0]?.region ?? "center";
     result.warningRegion = nearestObstacle?.region ?? null;
 
+    // Path occupancy analysis (matches production)
+    const pathOccupancy = analyzePathOccupancy(regions, opts.thresholds);
+    result.pathOccupancy = pathOccupancy;
+
     // Mean vs Percentile comparison (center/lower_center)
     const lowerCenter = regions.find(r => r.region === "lower_center");
     const center = regions.find(r => r.region === "center");
@@ -144,15 +213,31 @@ async function calibrateImage(
       }
     }
 
-    // Assistive validation
+    // Assistive validation — use REAL Gemma inference (not mock)
     if (opts.validate) {
       try {
         const { fuseGemmaWithDepth } = await import("../src/services/depth/responseFusion");
         const { analyzeDepthMap } = await import("../src/services/depth/depthAnalysis");
         const analysis = analyzeDepthMap(depthData, outW, outH, inferenceMs);
-        const mockGemma = "Terdapat objek di depan Anda.";
-        const fused = fuseGemmaWithDepth(mockGemma, analysis);
-        result.assistiveNarration = fused.description;
+
+        // Call real Gemma via LM Studio
+        const userCommand = opts.userCommand ?? "deskripsikan apa yang ada di depan saya";
+        const gemmaStart = performance.now();
+        const gemmaResult = await callGemma(imageBuffer, userCommand);
+        const gemmaMs = performance.now() - gemmaStart;
+
+        if (gemmaResult) {
+          const fused = fuseGemmaWithDepth(gemmaResult.sanitized, analysis);
+          result.assistiveNarration = fused.description;
+          result.gemmaRaw = gemmaResult.raw;
+          result.gemmaSanitized = gemmaResult.sanitized;
+          result.gemmaMs = gemmaMs;
+        } else {
+          // Fallback: depth-only narration
+          const fused = fuseGemmaWithDepth("(Gemma tidak tersedia)", analysis);
+          result.assistiveNarration = `[depth-only] ${fused.description}`;
+          result.gemmaMs = 0;
+        }
       } catch { result.assistiveNarration = "(fusion import failed)"; }
     }
 
@@ -177,10 +262,16 @@ async function calibrateImage(
     if (nearestObstacle) {
       console.log(`│ 🎯 Nearest obstacle: ${nearestObstacle.region} @ ${nearestObstacle.depthM.toFixed(3)}m`);
       console.log(`│    Proximity:       ${nearestObstacle.proximity} (${nearestObstacle.distanceBucket})`);
-      console.log(`│    Score:           ${nearestObstacle.score.toFixed(3)} (priority: ${nearestObstacle.priority})`);
+      console.log(`│    Legacy score:    ${nearestObstacle.score.toFixed(3)} (priority: ${nearestObstacle.priority})`);
+      console.log(`│    Nav score:       ${nearestObstacle.navigationScore.totalScore.toFixed(3)} (dist=${nearestObstacle.navigationScore.distanceScore.toFixed(2)} reg=${nearestObstacle.navigationScore.regionScore.toFixed(2)} size=${nearestObstacle.navigationScore.sizeScore.toFixed(2)} floor=${nearestObstacle.navigationScore.floorContactScore.toFixed(1)} center=${nearestObstacle.navigationScore.centerPathScore.toFixed(1)})`);
     } else {
       console.log(`│ ✅ No nearby obstacle detected (path clear)`);
     }
+
+    // Path occupancy
+    console.log(`│`);
+    console.log(`│ 🚶 Path occupancy:  ${pathOccupancy.safestDirection} (center=${pathOccupancy.centerPathBlocked ? "blocked" : "clear"}, left=${pathOccupancy.leftPathClear ? "clear" : "blocked"}, right=${pathOccupancy.rightPathClear ? "clear" : "blocked"})`);
+    console.log(`│    Summary:         ${pathOccupancy.summary}`);
 
     console.log(`│`);
     if (result.expectedM !== undefined) {
@@ -192,9 +283,20 @@ async function calibrateImage(
     console.log(`│ Preprocess:        ${preprocessMs.toFixed(0)}ms`);
     console.log(`│ Inference:         ${inferenceMs.toFixed(0)}ms`);
     console.log(`│ Analysis:          ${analysisMs.toFixed(1)}ms`);
-    console.log(`│ Total:             ${result.timing.totalMs.toFixed(0)}ms`);
+    console.log(`│ Total (depth):     ${result.timing.totalMs.toFixed(0)}ms`);
+    if (result.gemmaMs) console.log(`│ Gemma latency:     ${result.gemmaMs.toFixed(0)}ms`);
     console.log(`│ Memory:            RSS=${mem.rss}, Heap=${mem.heap}`);
-    if (result.assistiveNarration) console.log(`│ 🔊 Narration:      "${result.assistiveNarration}"`);
+    if (result.gemmaRaw) {
+      console.log(`│`);
+      console.log(`│ 🤖 Gemma raw (pre-sanitize):`);
+      console.log(`│    "${result.gemmaRaw}"`);
+      if (result.gemmaSanitized && result.gemmaSanitized !== result.gemmaRaw) {
+        console.log(`│ 🧹 Gemma sanitized:`);
+        console.log(`│    "${result.gemmaSanitized}"`);
+      }
+    }
+    if (result.assistiveNarration) console.log(`│ 🔊 Fused narration: "${result.assistiveNarration}"`);
+    if (opts.userCommand) console.log(`│ 💬 Command:         "${opts.userCommand}"`);
     console.log(`└${"─".repeat(51)}`);
 
     // Region detail (expanded)
@@ -371,7 +473,9 @@ function printThesisDocumentation(results: ImageCalibrationResult[], opts: CLIOp
   console.log(`Model:            Depth-Anything-V2-Metric-Indoor-Small`);
   console.log(`Model type:       Metric indoor (ONNX, CPU inference)`);
   console.log(`Input resolution: 518×518 (fixed DPT constraint)`);
-  console.log(`Analysis method:  Percentile-based (p5) + obstacle prioritization`);
+  console.log(`Gemma input res:  512×512 (IMAGE_MAX_DIMENSION)`);
+  console.log(`Analysis method:  Percentile-based (p5) + multi-factor navigation scoring`);
+  console.log(`Scoring factors:  distance(0.4) + region(0.25) + size(0.15) + floor(0.1) + center(0.1)`);
   console.log(`Regions:          9 assistive zones with priority weights`);
   console.log(`Images tested:    ${ok.length}`);
   console.log(`Thresholds (m):   [${opts.thresholds.sangat_dekat}, ${opts.thresholds.dekat}, ${opts.thresholds.sedang}]`);
@@ -384,6 +488,20 @@ function printThesisDocumentation(results: ImageCalibrationResult[], opts: CLIOp
   console.log(`Avg inference:    ${avgInf.toFixed(0)}ms`);
   console.log(`Avg analysis:     ${avgAnalysis.toFixed(1)}ms`);
 
+  // Path occupancy summary
+  const withOccupancy = ok.filter(r => r.pathOccupancy);
+  if (withOccupancy.length > 0) {
+    const directionCounts: Record<string, number> = {};
+    for (const r of withOccupancy) {
+      const dir = r.pathOccupancy!.safestDirection;
+      directionCounts[dir] = (directionCounts[dir] ?? 0) + 1;
+    }
+    console.log(`\nPath occupancy distribution:`);
+    for (const [dir, count] of Object.entries(directionCounts)) {
+      console.log(`  ${dir}: ${count}/${withOccupancy.length} images`);
+    }
+  }
+
   console.log("\nKnown limitations:");
   console.log("  - Monocular depth is inherently approximate (no stereo baseline)");
   console.log("  - Model trained primarily on indoor NYU-Depth-V2 data");
@@ -392,9 +510,11 @@ function printThesisDocumentation(results: ImageCalibrationResult[], opts: CLIOp
 
   console.log("\nObstacle prioritization notes:");
   console.log("  - p5 percentile used for obstacle detection (5th percentile of region depth)");
+  console.log("  - Multi-factor navigation scoring: distance × region × size × floor × center");
   console.log("  - 9 priority-weighted regions with floor-level emphasis");
   console.log("  - Noise protection via ≥0.5% obstacle ratio threshold");
   console.log("  - Nearest obstacle prioritized over scene-wide average");
+  console.log("  - Path occupancy analysis for directional guidance");
   console.log("  - Best accuracy at 0.5m–5m range (training distribution)");
 }
 
@@ -405,12 +525,17 @@ async function main(): Promise<void> {
 
   console.log("═══════════════════════════════════════════════════════════");
   console.log("  MBG Depth Estimation — Calibration & Validation");
-  console.log("  (Percentile-Based Obstacle Prioritization)");
+  console.log("  (Percentile-Based + Real Gemma Inference)");
   console.log("═══════════════════════════════════════════════════════════");
   console.log(`📂 Input:      ${opts.inputPath}`);
   console.log(`📂 Mode:       ${opts.isBatch ? "batch (directory)" : "single image"}`);
   console.log(`📐 Thresholds: [${opts.thresholds.sangat_dekat}, ${opts.thresholds.dekat}, ${opts.thresholds.sedang}]m ${opts.isCustomThresholds ? "(custom)" : "(production)"}`);
   console.log(`📐 Analysis:   p5 percentile + obstacle ratio ≥0.5%`);
+  if (opts.validate) {
+    console.log(`🤖 Gemma:      ${LM_STUDIO_MODEL} @ ${LM_STUDIO_URL}`);
+    console.log(`💬 Command:    "${opts.userCommand ?? "deskripsikan apa yang ada di depan saya"}"`);
+    console.log(`📷 Image res:  ${IMAGE_MAX_DIMENSION}×${IMAGE_MAX_DIMENSION} (Gemma input)`);
+  }
   if (opts.metadata) console.log(`📋 Metadata:   ${opts.metadataPath} (${Object.keys(opts.metadata).length} entries)`);
   console.log(`🔧 Flags:      ${[opts.validate && "validate", opts.debug && "debug", opts.recommend && "recommend"].filter(Boolean).join(", ") || "none"}`);
 

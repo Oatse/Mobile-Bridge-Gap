@@ -34,11 +34,20 @@ const WEIGHT_KNOWN = 0.15;
 // ─── Known Objects Set ──────────────────────────────────────────────────────
 
 const KNOWN_OBJECTS_SET: ReadonlySet<string> = new Set([
+  // Human entities
+  "orang", "anak", "anak perempuan", "anak laki-laki", "anak kecil",
+  "pria", "wanita", "manusia", "seseorang", "bayi",
+  "orang tua", "orang dewasa",
+  "seorang anak", "seorang anak perempuan", "seorang anak laki-laki",
+  // Dangerous objects
   "pisau", "gunting", "pecahan kaca", "pecahan", "benda tajam",
   "kabel", "kabel listrik",
+  // Floor hazards
   "tangga", "anak tangga", "lubang", "genangan", "lantai basah",
+  // Furniture
   "kursi", "meja", "lemari", "sofa", "rak", "bangku", "tempat tidur", "kasur",
   "bufet", "kabinet", "laci",
+  // Common objects
   "pintu", "jendela", "dinding",
   "kipas", "kipas angin", "televisi", "tv",
   "tas", "sepatu", "sandal", "kotak", "kardus",
@@ -46,6 +55,16 @@ const KNOWN_OBJECTS_SET: ReadonlySet<string> = new Set([
   "karpet", "tikar", "matras",
   "tiang", "pilar", "pagar",
   "payung", "tongkat", "sapu",
+  // Electronics/devices
+  "tablet", "laptop", "ponsel", "handphone", "komputer",
+]);
+
+/** Human entity terms for special handling */
+const HUMAN_ENTITIES_SET: ReadonlySet<string> = new Set([
+  "orang", "anak", "anak perempuan", "anak laki-laki", "anak kecil",
+  "pria", "wanita", "manusia", "seseorang", "bayi",
+  "orang tua", "orang dewasa",
+  "seorang anak", "seorang anak perempuan", "seorang anak laki-laki",
 ]);
 
 // ─── Region Plausibility ────────────────────────────────────────────────────
@@ -53,23 +72,34 @@ const KNOWN_OBJECTS_SET: ReadonlySet<string> = new Set([
 type PlausibilityCategory = "floor" | "furniture" | "wall" | "hanging" | "any";
 
 const OBJECT_PLAUSIBILITY: Record<string, PlausibilityCategory> = {
+  // Humans can appear anywhere
+  "orang": "any", "anak": "any", "anak perempuan": "any", "anak laki-laki": "any",
+  "pria": "any", "wanita": "any", "manusia": "any", "seseorang": "any", "bayi": "any",
+  "orang tua": "any", "orang dewasa": "any", "anak kecil": "any",
+  "seorang anak": "any", "seorang anak perempuan": "any", "seorang anak laki-laki": "any",
+  // Floor objects
   "kabel": "floor", "kabel listrik": "floor",
   "sepatu": "floor", "sandal": "floor",
   "karpet": "floor", "tikar": "floor", "matras": "floor",
   "genangan": "floor", "lantai basah": "floor", "lubang": "floor",
   "tangga": "floor", "anak tangga": "floor",
+  // Furniture
   "kursi": "furniture", "meja": "furniture", "lemari": "furniture",
   "sofa": "furniture", "rak": "furniture", "bangku": "furniture",
   "tempat tidur": "furniture", "kasur": "furniture",
   "bufet": "furniture", "kabinet": "furniture",
+  // Wall-mounted
   "jendela": "wall", "pintu": "wall",
   "televisi": "wall", "tv": "wall",
+  // Hanging
   "kipas": "hanging", "kipas angin": "hanging",
+  // Anywhere
   "tas": "any", "kotak": "any", "kardus": "any",
   "botol": "any", "gelas": "any", "piring": "any",
   "pisau": "any", "gunting": "any",
   "payung": "any", "tongkat": "any", "sapu": "any",
   "tiang": "any", "pilar": "any", "pagar": "any",
+  "tablet": "any", "laptop": "any", "ponsel": "any", "handphone": "any", "komputer": "any",
 };
 
 const FLOOR_REGIONS: ReadonlySet<DepthRegion> = new Set([
@@ -171,12 +201,22 @@ export function scoreConfidence(
 /**
  * Applies confidence-based naming to an object identity.
  * High (≥0.7): "kursi" | Medium (0.4-0.7): "terlihat seperti kursi" | Low (<0.4): "halangan"
+ * EXCEPTION: Humans NEVER degrade to "halangan" regardless of confidence.
  */
 export function applyConfidenceNaming(
   objectName: string | null,
   confidence: ObjectConfidence
 ): string {
   if (!objectName) return "halangan";
+
+  // Humans are always preserved — never degrade to "halangan"
+  const isHuman = HUMAN_ENTITIES_SET.has(objectName.toLowerCase())
+    || Array.from(HUMAN_ENTITIES_SET).some(h => objectName.toLowerCase().includes(h));
+  if (isHuman) {
+    if (confidence.totalScore >= CONFIDENCE_HIGH_THRESHOLD) return objectName;
+    return `terlihat seperti ${objectName}`; // hedge but never erase
+  }
+
   if (confidence.totalScore >= CONFIDENCE_HIGH_THRESHOLD) return objectName;
   if (confidence.totalScore >= CONFIDENCE_MEDIUM_THRESHOLD) return `terlihat seperti ${objectName}`;
   return "halangan";

@@ -47,6 +47,11 @@ const SAFETY_CRITICAL_LEVELS: ReadonlySet<ProximityLevel> = new Set([
  * Ordered by navigation priority: dangerous > floor hazards > furniture > general.
  */
 const KNOWN_OBJECTS: readonly string[] = [
+  // Humans (HIGHEST priority for assistive narration)
+  "seorang anak perempuan", "seorang anak laki-laki", "seorang anak",
+  "anak perempuan", "anak laki-laki", "anak kecil",
+  "orang tua", "orang dewasa", "seseorang",
+  "orang", "anak", "pria", "wanita", "manusia", "bayi",
   // Dangerous objects
   "pisau", "gunting", "pecahan kaca", "pecahan", "benda tajam",
   "kabel", "kabel listrik",
@@ -63,6 +68,27 @@ const KNOWN_OBJECTS: readonly string[] = [
   "karpet", "tikar", "matras",
   "tiang", "pilar", "pagar",
   "payung", "tongkat", "sapu",
+  // Electronics/devices
+  "tablet", "laptop", "ponsel", "handphone", "komputer",
+];
+
+/** Human entity terms — these must NEVER be filtered or replaced */
+const HUMAN_ENTITIES: ReadonlySet<string> = new Set([
+  "orang", "anak", "anak perempuan", "anak laki-laki", "anak kecil",
+  "pria", "wanita", "manusia", "seseorang", "bayi",
+  "orang tua", "orang dewasa",
+  "seorang anak", "seorang anak perempuan", "seorang anak laki-laki",
+]);
+
+/**
+ * Negation patterns — objects preceded by these are NOT actually present.
+ * Prevents extracting "televisi" from "tidak terlihat televisi".
+ */
+const NEGATION_PATTERNS: readonly RegExp[] = [
+  /tidak\s+(?:terlihat|ada|tampak|terdeteksi)/i,
+  /tanpa\s+/i,
+  /bukan\s+/i,
+  /belum\s+(?:terlihat|ada)/i,
 ];
 
 /**
@@ -78,19 +104,44 @@ const SEMANTIC_FALLBACKS: Record<string, string> = {
 };
 
 /**
+ * Checks if an object name appears in a negated context in the text.
+ * E.g., "tidak terlihat televisi" → televisi is negated.
+ */
+function isNegatedInContext(text: string, objectName: string): boolean {
+  const lower = text.toLowerCase();
+  const objIdx = lower.indexOf(objectName.toLowerCase());
+  if (objIdx < 0) return false;
+
+  // Check the 40 chars before the object for negation patterns
+  const prefix = lower.substring(Math.max(0, objIdx - 40), objIdx);
+  return NEGATION_PATTERNS.some((p) => p.test(prefix));
+}
+
+/**
  * Extracts specific object names from Gemma's Indonesian description.
- * Returns the first matched known object, or null if none found.
+ * Returns the first matched known object that is NOT negated, or null.
  *
- * Strategy: scan Gemma output for known object names (longest match first),
- * then try pattern-based extraction for unknown objects.
+ * Strategy:
+ * 1. Scan for known objects (longest match first), skip if negated
+ * 2. Try pattern-based extraction for unknown objects
+ * 3. Soft extraction: preserve unknown nouns instead of returning null
  */
 export function extractObjectIdentity(gemmaText: string): string | null {
   const lower = gemmaText.toLowerCase();
+  const skipped: string[] = [];
 
-  // Direct match against known objects (longest first to match "kipas angin" before "kipas")
+  // Direct match against known objects (longest first)
   const sortedObjects = [...KNOWN_OBJECTS].sort((a, b) => b.length - a.length);
   for (const obj of sortedObjects) {
     if (lower.includes(obj)) {
+      // Skip if object appears in negated context
+      if (isNegatedInContext(lower, obj)) {
+        skipped.push(obj);
+        continue;
+      }
+      if (skipped.length > 0) {
+        log.debug("Entity extraction: skipped negated", { skipped, selected: obj });
+      }
       return obj;
     }
   }
@@ -99,6 +150,7 @@ export function extractObjectIdentity(gemmaText: string): string | null {
   const patterns = [
     /(?:terdapat|ada|terlihat)\s+([\w\s]{2,20}?)\s+(?:di|dekat|sekitar|yang)/i,
     /(?:sebuah|beberapa)\s+([\w\s]{2,15}?)\s+(?:di|dekat|yang|terletak)/i,
+    /(?:seorang|seseorang)\s+([\w\s]{2,20}?)\s+(?:di|dekat|sedang|yang|menggunakan)/i,
   ];
 
   for (const pattern of patterns) {
@@ -109,17 +161,25 @@ export function extractObjectIdentity(gemmaText: string): string | null {
       if (SEMANTIC_FALLBACKS[extracted]) continue;
       // Reject very short or very long matches (likely noise)
       if (extracted.length < 3 || extracted.length > 20) continue;
+      // Reject if negated
+      if (isNegatedInContext(lower, extracted)) {
+        skipped.push(extracted);
+        continue;
+      }
       return extracted;
     }
   }
 
+  if (skipped.length > 0) {
+    log.debug("Entity extraction: all matches negated", { skipped });
+  }
   return null;
 }
 
 // ─── Object Danger Classification ───────────────────────────────────────────
 
 /** Object danger level for narration emphasis */
-type DangerLevel = "danger" | "furniture" | "floor_hazard" | "general";
+type DangerLevel = "danger" | "furniture" | "floor_hazard" | "human" | "general";
 
 /** Objects classified as dangerous (sharp, harmful) */
 const DANGER_OBJECTS: ReadonlySet<string> = new Set([
@@ -141,11 +201,17 @@ const FLOOR_HAZARD_OBJECTS: ReadonlySet<string> = new Set([
 
 /**
  * Classifies an extracted object name into a danger category.
- * Used for narration emphasis and priority.
+ * Humans get their own category — they must NEVER become "halangan".
  */
 export function classifyObjectDanger(objectName: string | null): DangerLevel {
   if (!objectName) return "general";
   const lower = objectName.toLowerCase();
+
+  // Humans are NEVER obstacles or hazards
+  if (HUMAN_ENTITIES.has(lower)) return "human";
+  for (const h of HUMAN_ENTITIES) {
+    if (lower.includes(h) || h.includes(lower)) return "human";
+  }
 
   if (DANGER_OBJECTS.has(lower)) return "danger";
   if (FLOOR_HAZARD_OBJECTS.has(lower)) return "floor_hazard";
@@ -195,28 +261,56 @@ function sanitizeFusedText(text: string): string {
 }
 
 /**
- * Detects contradictory safety statements in text.
- * Returns true if text contains both "safe" and "danger" indicators.
+ * Detects contradictory statements in text.
+ * Checks both safety contradictions and entity contradictions.
  */
-function hasContradiction(text: string): boolean {
+function hasContradiction(text: string, objectName?: string | null): boolean {
+  const lower = text.toLowerCase();
+
+  // Check safety contradictions
   const safeIndicators = ["aman", "terbuka", "bebas", "kosong"];
   const dangerIndicators = ["bahaya", "halangan", "sangat dekat", "hati-hati", "perhatian", "setengah meter", "sekitar 1 meter"];
+  const hasSafe = safeIndicators.some((w) => lower.includes(w));
+  const hasDanger = dangerIndicators.some((w) => lower.includes(w));
+  if (hasSafe && hasDanger) return true;
 
-  const hasSafe = safeIndicators.some((w) => text.toLowerCase().includes(w));
-  const hasDanger = dangerIndicators.some((w) => text.toLowerCase().includes(w));
+  // Check entity contradictions: "tidak terlihat X" + "ada X" in same text
+  if (objectName) {
+    const obj = objectName.toLowerCase();
+    const negated = NEGATION_PATTERNS.some((p) => {
+      const match = lower.match(p);
+      if (!match) return false;
+      // Check if the object appears after the negation
+      const afterNeg = lower.substring(match.index ?? 0);
+      return afterNeg.includes(obj);
+    });
+    const affirmed = new RegExp(`(?:ada|terdapat)\\s+(?:[\\w\\s]{0,10})?${escapeRegex(obj)}`, "i").test(lower);
+    if (negated && affirmed) {
+      log.debug("Entity contradiction detected", { object: objectName });
+      return true;
+    }
+  }
 
-  return hasSafe && hasDanger;
+  return false;
+}
+
+/** Escapes special regex characters */
+function escapeRegex(str: string): string {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 /**
  * Replaces generic Indonesian obstacle words with semantically useful alternatives.
- * Transforms "objek" → extracted object name or fallback category.
+ * Humans are NEVER replaced with "halangan".
  */
 function replaceGenericTerms(
   text: string,
   objectName: string | null,
   dangerLevel: DangerLevel
 ): string {
+  // Never replace human entities
+  if (dangerLevel === "human") return text;
+
   let result = text;
 
   // Determine replacement term
@@ -225,7 +319,6 @@ function replaceGenericTerms(
 
   // Replace generic terms with specific or category name
   for (const [generic, fallback] of Object.entries(SEMANTIC_FALLBACKS)) {
-    // Only replace if the generic word is used as a standalone obstacle reference
     const pattern = new RegExp(`(?:ada|terdapat|sebuah)\\s+${generic}\\b`, "gi");
     if (pattern.test(result)) {
       result = result.replace(
@@ -531,11 +624,14 @@ export function fuseGemmaWithDepth(
   // Step 5: Replace any remaining generic terms in the fused text
   fused = replaceGenericTerms(fused, objectName, dangerLevel);
 
-  // Step 6: Detect contradictions — if found, prefer the safety-critical version
-  if (hasContradiction(fused)) {
-    log.debug("Fusion: contradiction detected, using depth warning only");
-    const trimmed = gemmaDescription.replace(/[.!?]\s*$/, "");
-    fused = `${trimmed}. ${semanticWarning ?? depthResult.warning}.`;
+  // Step 6: Detect contradictions — if found, keep Gemma's original + path safety
+  if (hasContradiction(fused, objectName)) {
+    log.debug("Fusion: contradiction detected, preserving Gemma original", {
+      contradictedObject: objectName,
+      fusedPreview: fused.slice(0, 100),
+    });
+    // Keep Gemma's description as source of truth, only add path safety
+    fused = gemmaDescription;
   }
 
   // Step 7: Add path safety summary

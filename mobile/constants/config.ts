@@ -33,7 +33,7 @@ export const TRIGGER_DEBOUNCE_MS = 2_000;
 // ─── Status Messages (Indonesian) ───────────────────────────────────────────
 
 export const STATUS_MESSAGES = {
-  idle: "Siap menerima perintah.",
+  idle: "Siap menerima perintah",
   listening: "Mendengarkan...",
   processing: "Sedang menganalisis lingkungan...",
   speaking: "Menyampaikan hasil...",

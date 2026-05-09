@@ -195,9 +195,32 @@ async function runDepthTest(): Promise<void> {
   console.log(`   Overall proximity: ${analysis.proximity}`);
   console.log(`   Warning: ${analysis.warning ?? "(none — path clear)"}`);
   console.log(`   Processing time: ${analysis.processingMs.toFixed(0)}ms`);
+
+  // Nearest obstacle details
+  if (analysis.nearestObstacle) {
+    const o = analysis.nearestObstacle;
+    console.log(`\n   🎯 Nearest obstacle:`);
+    console.log(`     Region:         ${o.region}`);
+    console.log(`     Depth:          ${o.depthM.toFixed(3)}m (${o.distanceBucket})`);
+    console.log(`     Proximity:      ${o.proximity}`);
+    console.log(`     Legacy score:   ${o.score.toFixed(3)} (priority: ${o.priority})`);
+    console.log(`     Nav score:      ${o.navigationScore.totalScore.toFixed(3)} (dist=${o.navigationScore.distanceScore.toFixed(2)} reg=${o.navigationScore.regionScore.toFixed(2)} size=${o.navigationScore.sizeScore.toFixed(2)} floor=${o.navigationScore.floorContactScore.toFixed(1)} center=${o.navigationScore.centerPathScore.toFixed(1)})`);
+  } else {
+    console.log(`\n   ✅ No nearby obstacle detected (path clear)`);
+  }
+
+  // Path occupancy
+  const po = analysis.pathOccupancy;
+  console.log(`\n   🚶 Path occupancy:`);
+  console.log(`     Center path:    ${po.centerPathBlocked ? "BLOCKED" : "clear"}`);
+  console.log(`     Left path:      ${po.leftPathClear ? "clear" : "blocked"}`);
+  console.log(`     Right path:     ${po.rightPathClear ? "clear" : "blocked"}`);
+  console.log(`     Safest dir:     ${po.safestDirection}`);
+  console.log(`     Summary:        ${po.summary}`);
+
   console.log(`\n   Regions:`);
   for (const region of analysis.regions) {
-    console.log(`     ${region.region}: ${region.proximity} (est. ${region.estimatedDistanceM.toFixed(3)}m)`);
+    console.log(`     ${region.region}: ${region.proximity} (est. ${region.estimatedDistanceM.toFixed(3)}m, p5=${region.p5Depth.toFixed(3)}m, obs=${(region.obstacleRatio * 100).toFixed(1)}%)`);
   }
 
   // Step 6: Warm inference
@@ -225,6 +248,8 @@ async function runDepthTest(): Promise<void> {
   console.log(`   Memory (final):     ${formatMemory()}`);
   console.log(`   Proximity:          ${analysis.proximity}`);
   console.log(`   Warning:            ${analysis.warning ?? "none"}`);
+  console.log(`   Nearest obstacle:   ${analysis.nearestObstacle ? `${analysis.nearestObstacle.region} @ ${analysis.nearestObstacle.depthM.toFixed(3)}m (navScore=${analysis.nearestObstacle.navigationScore.totalScore.toFixed(3)})` : "none"}`);
+  console.log(`   Path safety:        ${po.safestDirection} — ${po.summary}`);
   console.log("═══════════════════════════════════════════════════════════");
   console.log("\n✅ All depth estimation tests passed!");
 }

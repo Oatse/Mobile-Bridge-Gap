@@ -64,6 +64,16 @@ export const SAFETY_REGIONS = new Set([
   "lower_center", "center", "lower_left", "lower_right", "left", "right",
 ]);
 
+/** Floor-level regions (receive floor-contact score boost) */
+export const FLOOR_REGIONS = new Set([
+  "lower_center", "lower_left", "lower_right",
+]);
+
+/** Center walking path regions (receive center-path boost) */
+export const CENTER_PATH_REGIONS = new Set([
+  "lower_center", "center",
+]);
+
 // ─── Types ──────────────────────────────────────────────────────────────────
 
 export type ProximityLevel = "sangat_dekat" | "dekat" | "sedang" | "jauh";
@@ -97,6 +107,16 @@ export interface TimingBreakdown {
   totalMs: number;
 }
 
+/** Multi-factor navigation importance score (matches production) */
+export interface NavigationScore {
+  distanceScore: number;
+  regionScore: number;
+  sizeScore: number;
+  floorContactScore: number;
+  centerPathScore: number;
+  totalScore: number;
+}
+
 export interface ObstacleDetection {
   region: string;
   depthM: number;
@@ -104,7 +124,26 @@ export interface ObstacleDetection {
   priority: number;
   score: number;
   distanceBucket: string;
+  /** Multi-factor navigation importance score */
+  navigationScore: NavigationScore;
 }
+
+/** Path occupancy analysis (matches production) */
+export interface PathOccupancy {
+  centerPathBlocked: boolean;
+  leftPathClear: boolean;
+  rightPathClear: boolean;
+  safestDirection: "depan" | "kiri" | "kanan" | "tidak ada";
+  summary: string;
+}
+
+/** Occupancy severity levels (matches production) */
+export type OccupancySeverity =
+  | "clear"
+  | "partially_blocked"
+  | "narrow"
+  | "blocked"
+  | "dangerous";
 
 export interface ImageCalibrationResult {
   filename: string;
@@ -117,9 +156,17 @@ export interface ImageCalibrationResult {
   warningRegion?: string | null;
   /** Nearest obstacle from percentile-based detection */
   nearestObstacle?: ObstacleDetection | null;
+  /** Path occupancy analysis */
+  pathOccupancy?: PathOccupancy;
   expectedM?: number;
   deviation?: number;
   assistiveNarration?: string;
+  /** Raw Gemma response before fusion */
+  gemmaRaw?: string;
+  /** Sanitized Gemma response (after sanitizeResponse) */
+  gemmaSanitized?: string;
+  /** Gemma inference time (ms) */
+  gemmaMs?: number;
   memory?: { rss: string; heap: string };
   /** Debug: mean-based vs percentile-based comparison */
   comparison?: {
@@ -142,6 +189,8 @@ export interface CLIOptions {
   debug: boolean;
   recommend: boolean;
   outputPath: string;
+  /** User command for Gemma inference (e.g. "apakah ada bahaya") */
+  userCommand: string | null;
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -245,7 +294,33 @@ export function getRegionStats(
 }
 
 /**
- * Detects nearest obstacle using priority-weighted percentile analysis.
+ * Calculates multi-factor navigation importance score.
+ * Matches production calculateNavigationScore() logic.
+ */
+export function calculateNavigationScore(
+  region: string,
+  depthM: number,
+  priority: number,
+  obstacleRatio: number
+): NavigationScore {
+  const distanceScore = 1 / Math.max(depthM, 0.1);
+  const regionScore = priority;
+  const sizeScore = Math.min(obstacleRatio * 2, 1.0);
+  const floorContactScore = FLOOR_REGIONS.has(region) ? 0.3 : 0;
+  const centerPathScore = CENTER_PATH_REGIONS.has(region) ? 0.2 : 0;
+
+  const totalScore =
+    distanceScore * 0.4 +
+    regionScore * 0.25 +
+    sizeScore * 0.15 +
+    floorContactScore * 0.1 +
+    centerPathScore * 0.1;
+
+  return { distanceScore, regionScore, sizeScore, floorContactScore, centerPathScore, totalScore };
+}
+
+/**
+ * Detects nearest obstacle using multi-factor navigation scoring.
  * Matches production detectNearestObstacle() logic.
  */
 export function detectNearestObstacle(
@@ -254,7 +329,7 @@ export function detectNearestObstacle(
   obstacleMinRatio: number = DEFAULT_OBSTACLE_MIN_RATIO
 ): ObstacleDetection | null {
   let best: ObstacleDetection | null = null;
-  let bestScore = 0;
+  let bestNavScore = 0;
 
   for (const r of regions) {
     if (!SAFETY_REGIONS.has(r.region)) continue;
@@ -263,9 +338,11 @@ export function detectNearestObstacle(
     const p5Proximity = classifyDepth(r.p5, thresholds);
     if (p5Proximity === "jauh") continue;
 
-    const score = (1 / Math.max(r.p5, 0.1)) * r.priority;
-    if (score > bestScore) {
-      bestScore = score;
+    const navigationScore = calculateNavigationScore(r.region, r.p5, r.priority, r.obstacleRatio);
+    const score = (1 / Math.max(r.p5, 0.1)) * r.priority; // legacy score
+
+    if (navigationScore.totalScore > bestNavScore) {
+      bestNavScore = navigationScore.totalScore;
       best = {
         region: r.region,
         depthM: r.p5,
@@ -273,11 +350,54 @@ export function detectNearestObstacle(
         priority: r.priority,
         score,
         distanceBucket: depthToDistanceBucket(r.p5),
+        navigationScore,
       };
     }
   }
 
   return best;
+}
+
+/**
+ * Analyzes path occupancy for navigation guidance.
+ * Matches production analyzePathOccupancy() logic.
+ */
+export function analyzePathOccupancy(
+  regions: RegionResult[],
+  thresholds: Thresholds,
+  obstacleMinRatio: number = DEFAULT_OBSTACLE_MIN_RATIO
+): PathOccupancy {
+  const hasObstacle = (regionName: string): boolean => {
+    const r = regions.find(x => x.region === regionName);
+    if (!r) return false;
+    return r.obstacleRatio >= obstacleMinRatio && classifyDepth(r.p5, thresholds) !== "jauh";
+  };
+
+  const centerPathBlocked = hasObstacle("lower_center") || hasObstacle("center");
+  const leftPathClear = !hasObstacle("lower_left") && !hasObstacle("left");
+  const rightPathClear = !hasObstacle("lower_right") && !hasObstacle("right");
+
+  let safestDirection: PathOccupancy["safestDirection"];
+  let summary: string;
+
+  if (!centerPathBlocked) {
+    safestDirection = "depan";
+    summary = "Jalur depan relatif aman.";
+  } else if (leftPathClear && rightPathClear) {
+    safestDirection = "kiri";
+    summary = "Jalur depan terhalang. Sisi kiri dan kanan tampak aman.";
+  } else if (leftPathClear) {
+    safestDirection = "kiri";
+    summary = "Jalur depan terhalang. Sisi kiri tampak lebih aman.";
+  } else if (rightPathClear) {
+    safestDirection = "kanan";
+    summary = "Jalur depan terhalang. Sisi kanan tampak lebih aman.";
+  } else {
+    safestDirection = "tidak ada";
+    summary = "Perhatian, halangan di beberapa arah. Berjalan dengan sangat hati-hati.";
+  }
+
+  return { centerPathBlocked, leftPathClear, rightPathClear, safestDirection, summary };
 }
 
 // ─── Histogram ──────────────────────────────────────────────────────────────
@@ -350,6 +470,9 @@ export function parseCLI(argv: string[], defaultThresholds: Thresholds): CLIOpti
     return i !== -1 && i + 1 < argv.length ? argv[i + 1]! : null;
   };
 
+  // User command for Gemma (default: general description)
+  const userCommand = flagVal("--command");
+
   // Thresholds
   let thresholds = { ...defaultThresholds };
   const isCustomThresholds = flagIdx("--thresholds") !== -1;
@@ -399,6 +522,7 @@ export function parseCLI(argv: string[], defaultThresholds: Thresholds): CLIOpti
     debug: flagIdx("--debug") !== -1,
     recommend: flagIdx("--recommend") !== -1,
     outputPath,
+    userCommand,
   };
 }
 
