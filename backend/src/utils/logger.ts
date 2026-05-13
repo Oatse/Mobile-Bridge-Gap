@@ -48,6 +48,16 @@ function debug(message: string, data?: LogData): void {
   console.log(`[${formatTimestamp()}] 🔍 ${message}${formatData(data)}`);
 }
 
+/**
+ * Tunnel-specific logging — records requests arriving through Cloudflare Tunnel.
+ * Only active in production mode to avoid noise during local development.
+ */
+function tunnel(path: string, clientIp: string): void {
+  console.log(
+    `[${formatTimestamp()}] 🌐 TUNNEL ${path} from ${clientIp}`
+  );
+}
+
 export const log = {
   info,
   warn,
@@ -55,4 +65,6 @@ export const log = {
   request,
   startup,
   debug,
+  tunnel,
 } as const;
+

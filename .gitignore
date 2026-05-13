@@ -54,3 +54,6 @@ backend/models/
 # Test/benchmark artifacts
 backend/scripts/test-image.*
 backend/scripts/*-results.json
+
+# Cloudflare Tunnel credentials (user-level, never commit)
+.cloudflared/

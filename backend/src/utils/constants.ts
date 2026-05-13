@@ -3,10 +3,40 @@
  * Values can be overridden via environment variables.
  */
 
+// ─── Environment ────────────────────────────────────────────────────────────
+
+/** Current environment mode */
+export const NODE_ENV = process.env.NODE_ENV || "development";
+
+/** Whether the server is running in production (tunnel) mode */
+export const IS_PRODUCTION = NODE_ENV === "production";
+
 // ─── Server ─────────────────────────────────────────────────────────────────
 
 /** Server port */
 export const PORT = Number(process.env.PORT) || 3000;
+
+// ─── Security ───────────────────────────────────────────────────────────────
+
+/**
+ * API token for authenticating requests through the tunnel.
+ * If empty, token authentication is disabled (local dev mode).
+ * Set via API_TOKEN env var for production usage.
+ */
+export const API_TOKEN = process.env.API_TOKEN || "";
+
+/** Public-facing production URL (used for CORS and logging) */
+export const PRODUCTION_URL =
+  process.env.PRODUCTION_URL || "https://api.mbridgegap.my.id";
+
+// ─── Rate Limiting ──────────────────────────────────────────────────────────
+
+/** Maximum requests per IP within the rate limit window */
+export const RATE_LIMIT_MAX = Number(process.env.RATE_LIMIT_MAX) || 30;
+
+/** Rate limit sliding window duration (ms) */
+export const RATE_LIMIT_WINDOW_MS =
+  Number(process.env.RATE_LIMIT_WINDOW_MS) || 60_000;
 
 // ─── LM Studio ──────────────────────────────────────────────────────────────
 

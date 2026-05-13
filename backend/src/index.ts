@@ -7,10 +7,11 @@
 import { Elysia } from "elysia";
 import { cors } from "@elysia/cors";
 import { describeRoute } from "./routes/describe";
+import { securityMiddleware } from "./middleware/security";
 import { getHealthStatus, healthStatusToHttpCode } from "./services/healthService";
 import { verifyModelReady, logReadinessStatus } from "./services/modelManager";
 import { preloadDepthModel } from "./services/depth/depthModel";
-import { PORT, LM_STUDIO_URL, MAX_BODY_SIZE_BYTES, ENABLE_DEPTH_ESTIMATION, DEPTH_INPUT_SIZE } from "./utils/constants";
+import { PORT, LM_STUDIO_URL, MAX_BODY_SIZE_BYTES, ENABLE_DEPTH_ESTIMATION, DEPTH_INPUT_SIZE, NODE_ENV, IS_PRODUCTION, PRODUCTION_URL, API_TOKEN } from "./utils/constants";
 import { log } from "./utils/logger";
 
 // ─── Startup Verification ───────────────────────────────────────────────────
@@ -38,9 +39,11 @@ const app = new Elysia()
     cors({
       origin: true,
       methods: ["GET", "POST", "OPTIONS"],
-      allowedHeaders: ["Content-Type"],
+      allowedHeaders: ["Content-Type", "X-API-Key"],
     })
   )
+  // Security middleware — API token auth + rate limiting
+  .use(securityMiddleware)
   // Global error handler — standardized error responses
   .onError(({ error, code, set }) => {
     if (code === "VALIDATION") {
@@ -96,7 +99,12 @@ const app = new Elysia()
 // ─── Startup Logging ────────────────────────────────────────────────────────
 
 log.startup(`MBG Backend running on http://0.0.0.0:${PORT}`);
+log.startup(`Environment: ${NODE_ENV}${IS_PRODUCTION ? " (production)" : ""}`);
 log.startup(`LM Studio endpoint: ${LM_STUDIO_URL}`);
+if (IS_PRODUCTION) {
+  log.startup(`Tunnel URL: ${PRODUCTION_URL}`);
+  log.startup(`API token: ${API_TOKEN ? "enabled" : "DISABLED (no token set)"}`);
+}
 log.startup(`POST /describe — send image + userCommand`);
 log.startup(`GET  /health    — live system health check`);
 
