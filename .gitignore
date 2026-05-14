@@ -57,3 +57,7 @@ backend/scripts/*-results.json
 
 # Cloudflare Tunnel credentials (user-level, never commit)
 .cloudflared/
+
+
+# PENULISAN
+PENULISAN
